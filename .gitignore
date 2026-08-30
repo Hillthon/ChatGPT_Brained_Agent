@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.venv/
+*.mp4
+推免考核题目学生版.pdf
