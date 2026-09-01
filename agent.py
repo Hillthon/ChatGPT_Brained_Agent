@@ -13,6 +13,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -455,52 +456,59 @@ When the task is complete, summarize changed files and verification. If blocked,
 
 
 class CodingAgent:
-    def __init__(self, client: OpenAICompatibleClient, workspace: Workspace, config: AgentConfig | None = None):
+    def __init__(self, client: OpenAICompatibleClient, workspace: Workspace, config: AgentConfig | None = None,
+                 messages: list[dict[str, Any]] | None = None,
+                 on_history_change: Callable[[list[dict[str, Any]]], None] | None = None):
         self.client = client
         self.workspace = workspace
         self.config = config or client.config
-        self.messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.messages = deepcopy(messages) if messages else [{"role": "system", "content": SYSTEM_PROMPT}]
+        if self.messages[0].get("role") != "system":
+            raise AgentError("session history must start with a system message")
+        self.on_history_change = on_history_change
+
+    def _checkpoint(self) -> None:
+        if self.on_history_change:
+            self.on_history_change(deepcopy(self.messages))
+
+    def _append_message(self, message: dict[str, Any]) -> None:
+        self.messages.append(message)
+        self._checkpoint()
 
     def _trim_context(self) -> None:
         serialized = json.dumps(self.messages, ensure_ascii=False)
         if len(serialized) <= self.config.max_context_chars:
             return
-        # Preserve system prompt and the newest turns. This is deterministic and avoids silently
-        # dropping the current tool result, which is more useful than old transcript detail.
+        # Keep complete user turns so trimming never separates a request from its response or
+        # an assistant tool call from its results. The newest turn is kept even if it alone is
+        # larger than the target, so the current user request is never silently discarded.
         system = self.messages[0]
-        kept: list[dict[str, Any]] = []
+        turns: list[list[dict[str, Any]]] = []
+        for message in self.messages[1:]:
+            if message.get("role") == "user" or not turns:
+                turns.append([])
+            turns[-1].append(message)
+        kept_turns: list[list[dict[str, Any]]] = []
         size = len(json.dumps(system, ensure_ascii=False))
-        index = len(self.messages)
-        while index > 1:
-            # Keep an assistant tool-call message together with all immediately following
-            # tool results. This preserves the Chat Completions message contract when trimming.
-            start = index - 1
-            if self.messages[start].get("role") == "tool":
-                while start > 1 and self.messages[start - 1].get("role") == "tool":
-                    start -= 1
-                if start > 1 and self.messages[start - 1].get("role") == "assistant" and self.messages[start - 1].get("tool_calls"):
-                    start -= 1
-            elif self.messages[start].get("role") == "assistant" and self.messages[start].get("tool_calls"):
-                start = max(1, start)
-            group = self.messages[start:index]
-            cost = len(json.dumps(group, ensure_ascii=False))
-            if size + cost > self.config.max_context_chars:
+        for turn in reversed(turns):
+            cost = len(json.dumps(turn, ensure_ascii=False))
+            if kept_turns and size + cost > self.config.max_context_chars:
                 break
-            kept[0:0] = group
+            kept_turns.insert(0, turn)
             size += cost
-            index = start
-        self.messages = [system] + kept
+        self.messages = [system] + [message for turn in kept_turns for message in turn]
+        self._checkpoint()
 
     def run(self, task: str, on_event: Callable[[str], None] | None = None) -> str:
         emit = on_event or (lambda _: None)
-        self.messages.append({"role": "user", "content": task})
+        self._append_message({"role": "user", "content": task})
         for step in range(1, self.config.max_steps + 1):
             self._trim_context()
             emit(f"step {step}/{self.config.max_steps}: thinking")
             assistant = self.client.complete(self.messages, TOOL_SCHEMAS)
             tool_calls = assistant.get("tool_calls") or []
             content = assistant.get("content") or ""
-            self.messages.append({"role": "assistant", "content": content, **({"tool_calls": tool_calls} if tool_calls else {})})
+            self._append_message({"role": "assistant", "content": content, **({"tool_calls": tool_calls} if tool_calls else {})})
             if not tool_calls:
                 return content.strip() or "完成。"
             for call in tool_calls:
@@ -516,13 +524,15 @@ class CodingAgent:
                 except Exception as exc:  # tool failures are recoverable model observations
                     result = f"ERROR: {exc}"
                     self.workspace._audit("tool_error", tool=name, error=str(exc))
-                self.messages.append({"role": "tool", "tool_call_id": call.get("id", name), "content": result})
+                self._append_message({"role": "tool", "tool_call_id": call.get("id", name), "content": result})
         return "达到最大步骤数，任务尚未确认完成。请检查工作区后继续。"
 
 
 def make_agent(root: str | Path, config: AgentConfig | None = None, approve: Callable[[str], bool] | None = None,
-               audit_path: str | Path | None = None, api_key: str | None = None) -> CodingAgent:
+               audit_path: str | Path | None = None, api_key: str | None = None,
+               messages: list[dict[str, Any]] | None = None,
+               on_history_change: Callable[[list[dict[str, Any]]], None] | None = None) -> CodingAgent:
     cfg = config or AgentConfig()
     client = OpenAICompatibleClient(cfg, api_key=api_key)
     workspace = Workspace(root, approve=approve, config=cfg, audit_path=audit_path)
-    return CodingAgent(client, workspace, cfg)
+    return CodingAgent(client, workspace, cfg, messages=messages, on_history_change=on_history_change)

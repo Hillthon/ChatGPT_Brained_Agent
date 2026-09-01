@@ -3,5 +3,7 @@ __pycache__/
 .pytest_cache/
 .env
 .venv/
+.coding-agent/
+tmp/
 *.mp4
 推免考核题目学生版.pdf
