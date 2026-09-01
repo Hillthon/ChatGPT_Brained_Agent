@@ -13,7 +13,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,41 +28,228 @@ class ModelError(AgentError):
 
 @dataclass
 class AgentConfig:
-    model: str = "gpt-4o-mini"
-    base_url: str = "https://api.openai.com/v1"
-    max_steps: int = 20
+    model: str = field(default_factory=lambda: os.environ.get("CODING_AGENT_MODEL", "gpt-5.6-luna"))
+    base_url: str = field(default_factory=lambda: (
+        os.environ.get("CODING_AGENT_BASE_URL")
+        or os.environ.get("RIGHTAPI_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or "https://rightapi.ai/codex/v1"
+    ))
+    max_steps: int = 100
     max_context_chars: int = 80_000
     command_timeout: int = 30
     max_output_chars: int = 12_000
+    api_mode: str = field(default_factory=lambda: os.environ.get("CODING_AGENT_API_MODE", "auto"))
+    request_timeout: int = 120
 
 
 class OpenAICompatibleClient:
-    """Minimal Chat Completions client using only the Python standard library."""
+    """OpenAI-compatible client using only the Python standard library.
+
+    Relay services generally expose Chat Completions or Responses under a
+    configurable path such as ``/codex/v1``. The agent keeps one internal
+    tool-call shape and translates Responses payloads at this boundary.
+    """
 
     def __init__(self, config: AgentConfig, api_key: str | None = None):
         self.config = config
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        self.api_key = (
+            api_key
+            or os.environ.get("CODING_AGENT_API_KEY")
+            or os.environ.get("RIGHTAPI_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
         if not self.api_key:
-            raise ModelError("OPENAI_API_KEY is not set")
+            raise ModelError("set OPENAI_API_KEY, RIGHTAPI_API_KEY, or CODING_AGENT_API_KEY")
+        mode = self.config.api_mode.strip().lower()
+        if mode in {"completions", "chat_completions"}:
+            mode = "chat"
+        if mode not in {"auto", "chat", "responses"}:
+            raise ModelError(f"unsupported API mode: {self.config.api_mode!r} (use auto, chat, or responses)")
+        self.api_mode = mode
 
-    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
-        endpoint = self.config.base_url.rstrip("/") + "/chat/completions"
-        body = {"model": self.config.model, "messages": messages, "tools": tools, "tool_choice": "auto"}
+    @staticmethod
+    def _endpoint(base_url: str, suffix: str) -> str:
+        """Build an endpoint without duplicating a suffix supplied by a user."""
+        base = base_url.strip().rstrip("/")
+        if not base:
+            raise ModelError("base URL is empty")
+        return base if base.endswith(suffix) else base + suffix
+
+    @staticmethod
+    def _response_error(exc: urllib.error.HTTPError) -> str:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace").strip()
+            if raw:
+                try:
+                    payload = json.loads(raw)
+                    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                        error = payload["error"]
+                        return str(error.get("message") or error.get("detail") or raw)
+                    return raw
+                except json.JSONDecodeError:
+                    return raw
+        except OSError:
+            pass
+        return str(exc.reason or exc)
+
+    def _request(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
             endpoint,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": "coding-agent/1.0",
+            },
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            error = ModelError(f"model request failed (HTTP {exc.code}): {self._response_error(exc)}")
+            error.status_code = exc.code  # type: ignore[attr-defined]
+            raise error from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise ModelError(f"model request failed: {exc}") from exc
         try:
-            return payload["choices"][0]["message"]
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ModelError(f"model returned invalid JSON: {raw[:500]!r}") from exc
+        if not isinstance(payload, dict):
+            raise ModelError(f"unexpected model response: {payload!r}")
+        return payload
+
+    @staticmethod
+    def _normalise_chat_message(message: dict[str, Any]) -> dict[str, Any]:
+        normalised = dict(message)
+        content = normalised.get("content")
+        if isinstance(content, list):
+            normalised["content"] = "".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+        return normalised
+
+    def _complete_chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        endpoint = self._endpoint(self.config.base_url, "/chat/completions")
+        payload = self._request(endpoint, {
+            "model": self.config.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+        })
+        try:
+            message = payload["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise TypeError("message is not an object")
+            return self._normalise_chat_message(message)
         except (KeyError, IndexError, TypeError) as exc:
-            raise ModelError(f"unexpected model response: {payload!r}") from exc
+            raise ModelError(f"unexpected Chat Completions response: {payload!r}") from exc
+
+    @staticmethod
+    def _responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted: list[dict[str, Any]] = []
+        for tool in tools:
+            function = tool.get("function", {})
+            converted.append({
+                "type": "function",
+                "name": function.get("name", ""),
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters", {"type": "object", "properties": {}}),
+            })
+        return converted
+
+    @staticmethod
+    def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted: list[dict[str, Any]] = []
+        for message in messages:
+            role = message.get("role")
+            if role == "assistant" and message.get("tool_calls"):
+                for call in message["tool_calls"]:
+                    function = call.get("function", {})
+                    converted.append({
+                        "type": "function_call",
+                        "call_id": call.get("id", function.get("name", "call")),
+                        "name": function.get("name", ""),
+                        "arguments": function.get("arguments", "{}"),
+                    })
+                if message.get("content"):
+                    converted.append({"role": "assistant", "content": message["content"]})
+            elif role == "tool":
+                converted.append({
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id", ""),
+                    "output": message.get("content", ""),
+                })
+            else:
+                converted.append({"role": role, "content": message.get("content", "")})
+        return converted
+
+    @staticmethod
+    def _responses_message(payload: dict[str, Any]) -> dict[str, Any]:
+        output = payload.get("output")
+        if not isinstance(output, list):
+            output_text = payload.get("output_text")
+            if isinstance(output_text, str):
+                return {"role": "assistant", "content": output_text}
+            raise ModelError(f"unexpected Responses response: {payload!r}")
+        content_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                content = item.get("content", [])
+                if isinstance(content, str):
+                    content_parts.append(content)
+                else:
+                    for part in content:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            content_parts.append(part["text"])
+            elif item.get("type") == "output_text" and isinstance(item.get("text"), str):
+                content_parts.append(item["text"])
+            elif item.get("type") == "function_call":
+                tool_calls.append({
+                    "id": item.get("call_id") or item.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                })
+        if not content_parts and isinstance(payload.get("output_text"), str):
+            content_parts.append(payload["output_text"])
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return message
+
+    def _complete_responses(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        endpoint = self._endpoint(self.config.base_url, "/responses")
+        payload = self._request(endpoint, {
+            "model": self.config.model,
+            "input": self._responses_input(messages),
+            "tools": self._responses_tools(tools),
+            "store": False,
+        })
+        return self._responses_message(payload)
+
+    def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        if self.api_mode == "responses":
+            return self._complete_responses(messages, tools)
+        if self.api_mode == "chat":
+            return self._complete_chat(messages, tools)
+        try:
+            return self._complete_chat(messages, tools)
+        except ModelError as exc:
+            # A 404/405 indicates a relay that exposes only Responses at this
+            # base path. Do not replay auth, quota, or malformed requests.
+            if getattr(exc, "status_code", None) not in {404, 405}:
+                raise
+            return self._complete_responses(messages, tools)
 
 
 def _json_schema(type_: str, description: str, **properties: Any) -> dict[str, Any]:
@@ -334,6 +521,8 @@ class CodingAgent:
 
 
 def make_agent(root: str | Path, config: AgentConfig | None = None, approve: Callable[[str], bool] | None = None,
-               audit_path: str | Path | None = None) -> CodingAgent:
+               audit_path: str | Path | None = None, api_key: str | None = None) -> CodingAgent:
     cfg = config or AgentConfig()
-    return CodingAgent(OpenAICompatibleClient(cfg), Workspace(root, approve=approve, config=cfg, audit_path=audit_path), cfg)
+    client = OpenAICompatibleClient(cfg, api_key=api_key)
+    workspace = Workspace(root, approve=approve, config=cfg, audit_path=audit_path)
+    return CodingAgent(client, workspace, cfg)

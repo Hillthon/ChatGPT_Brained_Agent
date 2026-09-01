@@ -4,7 +4,7 @@
 
 ## 迭代阶段
 
-1. **最小闭环**：`OpenAICompatibleClient` 发送 Chat Completions 请求，`CodingAgent.run` 保存消息、解析 `tool_calls`，调用本地工具，直到模型返回普通文本。
+1. **最小闭环**：`OpenAICompatibleClient` 发送 OpenAI 兼容的 Chat Completions/Responses 请求，`CodingAgent.run` 保存统一消息格式、解析 `tool_calls`，调用本地工具，直到模型返回普通文本。
 2. **真实编程工具**：加入目录浏览、带行号读取、文本搜索、整文件写入、单文件 unified diff 和命令执行。
 3. **安全边界**：所有路径通过 `Path.resolve()` 限制在 workspace；写入、补丁和命令逐次确认；拦截常见破坏性命令；命令超时且截断输出。
 4. **可靠性**：工具异常作为 `ERROR` 观察结果回传模型；最大步骤数防止死循环；上下文按完整对话组裁剪；可选 JSONL 审计日志记录副作用。
@@ -28,7 +28,7 @@
 
 ## 可辩护的取舍
 
-- 使用标准库 HTTP 客户端而非模型 SDK，减少依赖并让请求、响应解析和错误路径清晰可见；`--base-url` 兼容 OpenAI 风格网关。
+- 使用标准库 HTTP 客户端而非模型 SDK，减少依赖并让请求、响应解析和错误路径清晰可见；`--base-url`、`--api-mode` 兼容 OpenAI 风格中转网关，并支持 Chat Completions 与 Responses。
 - `apply_patch` 只接受单文件 unified diff，并逐行验证上下文，避免整文件重写覆盖用户改动。
 - 默认不自动批准副作用，CLI 逐次询问；自动化测试注入 `approve=lambda _: True`，模型客户端也可替换为 fake client。
 - 上下文裁剪优先保留最近完整工具轮次，避免把 assistant 的工具调用和 tool 结果拆开造成协议错误。
