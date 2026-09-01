@@ -2,6 +2,7 @@ import io
 import json
 import urllib.error
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -13,8 +14,10 @@ class FakeClient:
     def __init__(self, replies):
         self.replies = iter(replies)
         self.config = AgentConfig(max_steps=4)
+        self.calls = []
 
     def complete(self, messages, tools):
+        self.calls.append(deepcopy(messages))
         return next(self.replies)
 
 
@@ -88,6 +91,42 @@ class AgentTests(unittest.TestCase):
             agent = CodingAgent(FakeClient(replies), workspace)
             self.assertEqual(agent.run("create x"), "done")
             self.assertEqual((Path(directory) / "x.txt").read_text(), "ok")
+
+    def test_agent_reuses_context_across_tasks(self):
+        client = FakeClient([
+            {"content": "The value is 7", "tool_calls": []},
+            {"content": "You said 7", "tool_calls": []},
+        ])
+        with TemporaryDirectory() as directory:
+            agent = CodingAgent(client, Workspace(directory))
+            self.assertEqual(agent.run("Remember the value 7"), "The value is 7")
+            self.assertEqual(agent.run("What value did I give you?"), "You said 7")
+        second_call = client.calls[1]
+        self.assertEqual(
+            [(message["role"], message["content"]) for message in second_call[1:]],
+            [
+                ("user", "Remember the value 7"),
+                ("assistant", "The value is 7"),
+                ("user", "What value did I give you?"),
+            ],
+        )
+
+    def test_context_trimming_keeps_the_newest_complete_turn(self):
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old response"},
+            {"role": "user", "content": "current request"},
+        ]
+        with TemporaryDirectory() as directory:
+            agent = CodingAgent(
+                FakeClient([]),
+                Workspace(directory),
+                config=AgentConfig(max_context_chars=1),
+                messages=messages,
+            )
+            agent._trim_context()
+        self.assertEqual(agent.messages, [messages[0], messages[-1]])
 
     def test_chat_client_uses_relay_endpoint_and_auth(self):
         response = _FakeResponse({"choices": [{"message": {"role": "assistant", "content": "done"}}]})

@@ -8,27 +8,30 @@
 2. **真实编程工具**：加入目录浏览、带行号读取、文本搜索、整文件写入、单文件 unified diff 和命令执行。
 3. **安全边界**：所有路径通过 `Path.resolve()` 限制在 workspace；写入、补丁和命令逐次确认；拦截常见破坏性命令；命令超时且截断输出。
 4. **可靠性**：工具异常作为 `ERROR` 观察结果回传模型；最大步骤数防止死循环；上下文按完整对话组裁剪；可选 JSONL 审计日志记录副作用。
+5. **连续对话与会话**：CLI 在单个任务完成后继续接收输入；`SessionStore` 将多个独立消息历史持久化，并支持列出、新建、恢复和切换。
 
-## 一轮工具调用
+## 两层循环
 
 ```text
-用户任务 -> system/user messages -> 模型
-                       | 普通文本
-                       v
-                    最终回答
-                       |
-                       | tool_calls
-                       v
-          本地解析 JSON -> Workspace.execute
-                       |
-             tool 结果/错误 -> messages -> 模型
+session -> 用户任务 -> 模型 <-> 本地工具循环 -> 最终回答
+   ^         |                                  |
+   |         +---------- 完整历史 --------------+
+   +---- checkpoint JSON <- 继续提问 / 切换 session
 ```
 
 模型没有本地文件系统或代码执行权限。它只能请求 `TOOL_SCHEMAS` 中列出的操作，实际副作用由 `Workspace` 完成，因此不依赖服务端 Code Interpreter 或 Files API。
+
+## 会话边界
+
+- `CodingAgent.run()` 只结束当前任务，不销毁 agent；下一次调用会在同一 `messages` 上追加新的 user turn。
+- CLI 默认保持交互循环；`--once` 为自动化脚本保留原有单轮语义。`/new` 创建独立历史，`/switch` 恢复指定历史，`--continue-session` 在进程重启后恢复当前工作区最近的历史。
+- session 采用版本化 JSON，每条 user/assistant/tool 消息后立即 checkpoint，并通过同目录临时文件加 `replace` 原子更新。文件不保存 API key，且绑定规范化 workspace 路径，避免在错误项目中恢复上下文。
+- 默认 session 目录位于用户目录而非被 agent 操作的 workspace，防止模型通过文件工具读取会话控制数据；可显式覆盖存储位置。
+- 超过上下文字符预算时按完整 user turn 从旧到新丢弃，工具调用与结果不会拆开；即使最新 turn 本身超预算也会保留，避免静默丢失当前请求。
 
 ## 可辩护的取舍
 
 - 使用标准库 HTTP 客户端而非模型 SDK，减少依赖并让请求、响应解析和错误路径清晰可见；`--base-url`、`--api-mode` 兼容 OpenAI 风格中转网关，并支持 Chat Completions 与 Responses。
 - `apply_patch` 只接受单文件 unified diff，并逐行验证上下文，避免整文件重写覆盖用户改动。
 - 默认不自动批准副作用，CLI 逐次询问；自动化测试注入 `approve=lambda _: True`，模型客户端也可替换为 fake client。
-- 上下文裁剪优先保留最近完整工具轮次，避免把 assistant 的工具调用和 tool 结果拆开造成协议错误。
+- 上下文裁剪采用确定性策略而非额外调用模型总结，成本和失败路径更可控；代价是很早的细节可能被丢弃，后续可增加摘要层改善长期记忆。
