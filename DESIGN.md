@@ -9,8 +9,9 @@
 3. **安全边界**：所有路径通过 `Path.resolve()` 限制在 workspace；写入、补丁和命令逐次确认；拦截常见破坏性命令；命令超时且截断输出。
 4. **可靠性**：工具异常作为 `ERROR` 观察结果回传模型；最大步骤数防止死循环；上下文按完整对话组裁剪；可选 JSONL 审计日志记录副作用。
 5. **连续对话与会话**：CLI 在单个任务完成后继续接收输入；`SessionStore` 将多个独立消息历史持久化，并支持列出、新建、恢复和切换。
+6. **终端交互**：agent 只产生结构化事件，Renderer 决定默认、详细和安静模式的可见内容；模型文本可通过 SSE 增量输出。
 
-## 两层循环
+## 两层循环与事件
 
 ```text
 session -> 用户任务 -> 模型 <-> 本地工具循环 -> 最终回答
@@ -18,6 +19,8 @@ session -> 用户任务 -> 模型 <-> 本地工具循环 -> 最终回答
    |         +---------- 完整历史 --------------+
    +---- checkpoint JSON <- 继续提问 / 切换 session
 ```
+
+`CodingAgent.run()` 发出 `("thinking", {...})`、`("tool_call", {...})`、`("tool_start", {...})`、`("tool_end", {...})`、`("assistant_delta", text)` 和 `("run_end", {...})`。模型客户端的 `model_request`、`model_response`、`model_chunk` 事件只在 `-vv` 显示。这样工具执行逻辑不依赖终端格式，CLI 也不会把裸参数、session JSON 或 API payload 混入默认输出。
 
 模型没有本地文件系统或代码执行权限。它只能请求 `TOOL_SCHEMAS` 中列出的操作，实际副作用由 `Workspace` 完成，因此不依赖服务端 Code Interpreter 或 Files API。
 
@@ -28,6 +31,13 @@ session -> 用户任务 -> 模型 <-> 本地工具循环 -> 最终回答
 - session 采用版本化 JSON，每条 user/assistant/tool 消息后立即 checkpoint，并通过同目录临时文件加 `replace` 原子更新。文件不保存 API key，且绑定规范化 workspace 路径，避免在错误项目中恢复上下文。
 - 默认 session 目录位于用户目录而非被 agent 操作的 workspace，防止模型通过文件工具读取会话控制数据；可显式覆盖存储位置。
 - 超过上下文字符预算时按完整 user turn 从旧到新丢弃，工具调用与结果不会拆开；即使最新 turn 本身超预算也会保留，避免静默丢失当前请求。
+
+## 终端输出策略
+
+- 默认输出保持低噪音：Thinking 使用 `\r` 原地状态行；工具完成后输出 `✓/✗/⏱ + 动词 + 对象 + 状态`。只读工具正文默认不显示，命令只显示尾部 20 行。
+- `write_file` 和 `apply_patch` 在批准回调之前通过 `Workspace.preview()` 生成 unified diff，Renderer 先展示 diff，再由 CLI 提示确认；这使审核看到的内容与实际执行保持一致。
+- `-v` 打开只读工具结果和完整命令输出，`-vv` 加上原始工具调用及模型请求/响应/chunk；`-q` 隐藏动作行但仍保留等待状态和最终回答。错误默认一行显示，详细 traceback 只在 `-vv` 出现。
+- Chat Completions SSE 会重组文本和分片 tool-call arguments；Responses 支持 `response.output_text.delta`、`response.function_call_arguments.delta` 等事件。若网关忽略 `stream` 返回普通 JSON，解析器仍接受该响应。
 
 ## 可辩护的取舍
 

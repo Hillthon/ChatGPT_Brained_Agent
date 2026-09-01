@@ -36,6 +36,18 @@ class _FakeResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
+class _FakeStreamResponse:
+    def __init__(self, text):
+        self.lines = [line.encode("utf-8") for line in text.splitlines(keepends=True)]
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self.lines)
+
+    def close(self):
+        self.closed = True
+
+
 class AgentTests(unittest.TestCase):
     def test_workspace_cannot_escape(self):
         workspace = Workspace(Path.cwd())
@@ -91,6 +103,150 @@ class AgentTests(unittest.TestCase):
             agent = CodingAgent(FakeClient(replies), workspace)
             self.assertEqual(agent.run("create x"), "done")
             self.assertEqual((Path(directory) / "x.txt").read_text(), "ok")
+
+    def test_agent_emits_structured_events(self):
+        replies = [
+            {"content": "", "tool_calls": [{"id": "1", "function": {"name": "read_file", "arguments": json.dumps({"path": "x.txt", "start_line": 1})}}]},
+            {"content": "done", "tool_calls": []},
+        ]
+        events = []
+        with TemporaryDirectory() as directory:
+            (Path(directory) / "x.txt").write_text("ok\n", encoding="utf-8")
+            agent = CodingAgent(FakeClient(replies), Workspace(directory))
+            self.assertEqual(agent.run("read x", on_event=events.append), "done")
+        kinds = [event[0] for event in events]
+        self.assertIn("thinking", kinds)
+        self.assertIn("tool_start", kinds)
+        self.assertIn("tool_end", kinds)
+        self.assertIn("assistant_delta", kinds)
+        self.assertIn("run_end", kinds)
+        self.assertTrue(all(isinstance(event, tuple) for event in events))
+        self.assertFalse(any(isinstance(event, str) and "step" in event for event in events))
+
+    def test_chat_stream_forwards_deltas_and_reassembles_tool_calls(self):
+        stream = """data: {json1}
+
+data: {json2}
+
+data: {json3}
+
+data: [DONE]
+
+""".format(
+            json1=json.dumps({"choices": [{"delta": {"role": "assistant", "content": "hel"}}]}),
+            json2=json.dumps({"choices": [{"delta": {"content": "lo", "tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "read_file", "arguments": "{\"path\":\"x"}}]}}]}),
+            json3=json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": ".txt\"}"}}]}}]}),
+        )
+        response = _FakeStreamResponse(stream)
+        config = AgentConfig(base_url="https://relay.test/codex/v1", api_mode="chat")
+        client = OpenAICompatibleClient(config, api_key="relay-secret")
+        deltas = []
+        with patch("urllib.request.urlopen", return_value=response) as mocked:
+            message = client.complete_stream([{"role": "user", "content": "read"}], TOOL_SCHEMAS, deltas.append)
+        body = json.loads(mocked.call_args.args[0].data.decode("utf-8"))
+        self.assertTrue(body["stream"])
+        self.assertEqual("".join(deltas), "hello")
+        self.assertEqual(message["content"], "hello")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "read_file")
+        self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {"path": "x.txt"})
+        self.assertTrue(response.closed)
+
+    def test_stream_emits_model_debug_events_only_when_requested(self):
+        stream = "data: {payload}\n\ndata: [DONE]\n\n".format(
+            payload=json.dumps({"choices": [{"delta": {"content": "ok"}}]})
+        )
+        response = _FakeStreamResponse(stream)
+        config = AgentConfig(base_url="https://relay.test/codex/v1", api_mode="chat")
+        client = OpenAICompatibleClient(config, api_key="relay-secret")
+        events = []
+        with patch("urllib.request.urlopen", return_value=response):
+            agent = CodingAgent(client, Workspace(Path.cwd()))
+            agent.run("hello", on_event=events.append)
+        self.assertEqual([event[0] for event in events if event[0].startswith("model_")], [
+            "model_request", "model_chunk",
+        ])
+
+    def test_responses_stream_forwards_text_and_reassembles_function_arguments(self):
+        events = [
+            {"type": "response.output_text.delta", "delta": "ok"},
+            {"type": "response.output_item.added", "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read_file", "arguments": ""}},
+            {"type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"path\":\"x.txt\"}"},
+            {"type": "response.completed", "response": {"output": [{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read_file", "arguments": "{\"path\":\"x.txt\"}"}]}} ,
+        ]
+        stream = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+        response = _FakeStreamResponse(stream)
+        config = AgentConfig(base_url="https://relay.test/codex/v1", api_mode="responses")
+        client = OpenAICompatibleClient(config, api_key="relay-secret")
+        deltas = []
+        with patch("urllib.request.urlopen", return_value=response):
+            message = client.complete_stream([{"role": "user", "content": "read"}], TOOL_SCHEMAS, deltas.append)
+        self.assertEqual("".join(deltas), "ok")
+        self.assertEqual(message["content"], "ok")
+        self.assertEqual(len(message["tool_calls"]), 1)
+        self.assertEqual(message["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {"path": "x.txt"})
+
+    def test_stream_accepts_a_non_sse_responses_fallback_payload(self):
+        response = _FakeStreamResponse(json.dumps({"output_text": "ordinary response"}) + "\n")
+        config = AgentConfig(base_url="https://relay.test/codex/v1", api_mode="responses")
+        client = OpenAICompatibleClient(config, api_key="relay-secret")
+        deltas = []
+        with patch("urllib.request.urlopen", return_value=response):
+            message = client.complete_stream([{"role": "user", "content": "hello"}], TOOL_SCHEMAS, deltas.append)
+        self.assertEqual(message["content"], "ordinary response")
+        self.assertEqual(deltas, ["ordinary response"])
+
+    def test_tool_failure_is_reported_as_a_failed_tool_event(self):
+        client = FakeClient([
+            {"content": "", "tool_calls": [{"id": "1", "function": {"name": "read_file", "arguments": json.dumps({"path": "missing.py"})}}]},
+            {"content": "recovered", "tool_calls": []},
+        ])
+        events = []
+        with TemporaryDirectory() as directory:
+            agent = CodingAgent(client, Workspace(directory))
+            agent.run("read missing", on_event=events.append)
+        failed = [payload for kind, payload in events if kind == "tool_end" and not payload["ok"]]
+        self.assertEqual(len(failed), 1)
+        self.assertIn("not a file", failed[0]["error"])
+
+    def test_renderer_hides_read_results_and_shows_diff_and_command_tail(self):
+        from cli import Renderer
+
+        output = io.StringIO()
+        renderer = Renderer(stream=output, color=False)
+        renderer.on_event(("tool_start", {"name": "apply_patch", "arguments": {"path": "x.py"}, "preview": {"kind": "diff", "diff": "@@ -1 +1 @@\n-old\n+new\n"}}))
+        renderer.on_event(("tool_end", {"name": "apply_patch", "arguments": {"path": "x.py"}, "result": "patched x.py", "ok": True, "elapsed": 0.1}))
+        renderer.on_event(("tool_start", {"name": "read_file", "arguments": {"path": "x.py"}}))
+        renderer.on_event(("tool_end", {"name": "read_file", "arguments": {"path": "x.py"}, "result": "secret body", "ok": True, "elapsed": 0.1}))
+        renderer.on_event(("tool_start", {"name": "run_command", "arguments": {"command": "pytest"}}))
+        renderer.on_event(("tool_end", {"name": "run_command", "arguments": {"command": "pytest"}, "result": "exit_code=0\nline 1\nline 2", "ok": True, "elapsed": 0.1}))
+        rendered = output.getvalue()
+        self.assertIn("@@ -1 +1 @@", rendered)
+        self.assertIn("+new", rendered)
+        self.assertIn("line 2", rendered)
+        self.assertNotIn("secret body", rendered)
+
+    def test_write_file_preview_is_a_readable_unified_diff(self):
+        with TemporaryDirectory() as directory:
+            preview = Workspace(directory).preview("write_file", {"path": "new.py", "content": "print(1)\n"})
+        self.assertEqual(preview["diff"].splitlines()[:3], ["--- a/new.py", "+++ b/new.py", "@@ -0,0 +1 @@"])
+        self.assertIn("+print(1)", preview["diff"])
+
+    def test_renderer_quiet_keeps_thinking_and_answer_but_hides_actions(self):
+        from cli import Renderer
+
+        output = io.StringIO()
+        renderer = Renderer(stream=output, color=False, quiet=True)
+        renderer.on_event(("thinking", {"step": 1, "max_steps": 100}))
+        renderer.on_event(("tool_start", {"name": "read_file", "arguments": {"path": "x.py"}}))
+        renderer.on_event(("tool_end", {"name": "read_file", "arguments": {"path": "x.py"}, "result": "hidden", "ok": True, "elapsed": 0.1}))
+        renderer.on_event(("assistant_delta", "answer"))
+        renderer.on_event(("run_end", {"steps": 1, "elapsed": 0.1, "usage": {}}))
+        rendered = output.getvalue()
+        self.assertIn("Thinking", rendered)
+        self.assertIn("answer", rendered)
+        self.assertNotIn("read_file", rendered)
+        self.assertNotIn("hidden", rendered)
 
     def test_agent_reuses_context_across_tasks(self):
         client = FakeClient([
