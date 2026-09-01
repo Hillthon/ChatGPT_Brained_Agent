@@ -7,6 +7,7 @@ this process, which keeps the important execution logic local and inspectable.
 from __future__ import annotations
 
 import json
+import difflib
 import os
 import re
 import subprocess
@@ -16,7 +17,11 @@ import urllib.request
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+
+AgentEvent = tuple[str, Any]
+EventHandler = Callable[[AgentEvent], None]
 
 
 class AgentError(RuntimeError):
@@ -68,6 +73,23 @@ class OpenAICompatibleClient:
         if mode not in {"auto", "chat", "responses"}:
             raise ModelError(f"unsupported API mode: {self.config.api_mode!r} (use auto, chat, or responses)")
         self.api_mode = mode
+        self.last_usage: dict[str, Any] = {}
+        self.total_usage: dict[str, int] = {}
+        self.debug_handler: Callable[[str, Any], None] | None = None
+
+    def _debug(self, kind: str, payload: Any) -> None:
+        if self.debug_handler:
+            self.debug_handler(kind, payload)
+
+    def _record_usage(self, payload: dict[str, Any]) -> None:
+        usage = payload.get("usage")
+        if not isinstance(usage, dict):
+            return
+        self.last_usage = dict(usage)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens"):
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                self.total_usage[key] = self.total_usage.get(key, 0) + int(value)
 
     @staticmethod
     def _endpoint(base_url: str, suffix: str) -> str:
@@ -95,6 +117,7 @@ class OpenAICompatibleClient:
         return str(exc.reason or exc)
 
     def _request(self, endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+        self._debug("model_request", {"endpoint": endpoint, "body": body})
         request = urllib.request.Request(
             endpoint,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -121,7 +144,75 @@ class OpenAICompatibleClient:
             raise ModelError(f"model returned invalid JSON: {raw[:500]!r}") from exc
         if not isinstance(payload, dict):
             raise ModelError(f"unexpected model response: {payload!r}")
+        self._record_usage(payload)
+        self._debug("model_response", payload)
         return payload
+
+    @staticmethod
+    def _stream_request(endpoint: str, body: dict[str, Any], api_key: str, timeout: int):
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream, application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "coding-agent/1.0",
+            },
+            method="POST",
+        )
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            error = ModelError(f"model request failed (HTTP {exc.code}): {OpenAICompatibleClient._response_error(exc)}")
+            error.status_code = exc.code  # type: ignore[attr-defined]
+            raise error from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ModelError(f"model request failed: {exc}") from exc
+
+    @staticmethod
+    def _sse_payloads(response) -> Iterator[dict[str, Any]]:
+        """Yield JSON payloads from SSE, while accepting a non-SSE JSON fallback."""
+        pending: list[str] = []
+        non_sse: list[str] = []
+
+        def consume(data: str) -> dict[str, Any] | None:
+            if data.strip() == "[DONE]":
+                return None
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError as exc:
+                raise ModelError(f"model returned invalid SSE JSON: {data[:500]!r}") from exc
+            if not isinstance(payload, dict):
+                raise ModelError(f"unexpected streamed model response: {payload!r}")
+            return payload
+
+        for raw_line in response:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n") if isinstance(raw_line, bytes) else str(raw_line).rstrip("\r\n")
+            if line.startswith((":", "event:", "id:", "retry:")):
+                continue
+            if line.startswith("data:"):
+                pending.append(line[5:].lstrip())
+                continue
+            if line == "" and pending:
+                data = "\n".join(pending)
+                pending.clear()
+                payload = consume(data)
+                if payload is None:
+                    return
+                yield payload
+            elif not pending and line.strip():
+                if line.strip() == "[DONE]":
+                    return
+                non_sse.append(line.strip())
+        if pending:
+            payload = consume("\n".join(pending))
+            if payload is not None:
+                yield payload
+        if non_sse:
+            payload = consume("\n".join(non_sse))
+            if payload is not None:
+                yield payload
 
     @staticmethod
     def _normalise_chat_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -238,6 +329,180 @@ class OpenAICompatibleClient:
         })
         return self._responses_message(payload)
 
+    def _complete_stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        on_delta: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        endpoint = self._endpoint(self.config.base_url, "/chat/completions")
+        body = {
+            "model": self.config.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        self._debug("model_request", {"endpoint": endpoint, "body": body})
+        response = self._stream_request(endpoint, body, self.api_key, self.config.request_timeout)
+        content_parts: list[str] = []
+        calls: dict[int, dict[str, Any]] = {}
+        try:
+            for payload in self._sse_payloads(response):
+                self._record_usage(payload)
+                self._debug("model_chunk", payload)
+                choices = payload.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                choice = choices[0]
+                if not isinstance(choice, dict):
+                    continue
+                if isinstance(choice.get("message"), dict):
+                    direct = self._normalise_chat_message(choice["message"])
+                    text = direct.get("content") or ""
+                    if text:
+                        content_parts.append(text)
+                        if on_delta:
+                            on_delta(text)
+                    for index, call in enumerate(direct.get("tool_calls") or []):
+                        calls[index] = call
+                    continue
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                text = delta.get("content")
+                if isinstance(text, str) and text:
+                    content_parts.append(text)
+                    if on_delta:
+                        on_delta(text)
+                for fallback_index, call in enumerate(delta.get("tool_calls") or []):
+                    if not isinstance(call, dict):
+                        continue
+                    index = call.get("index", fallback_index)
+                    try:
+                        index = int(index)
+                    except (TypeError, ValueError):
+                        index = fallback_index
+                    entry = calls.setdefault(index, {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if call.get("id"):
+                        entry["id"] = call["id"]
+                    function = call.get("function") or {}
+                    if isinstance(function, dict):
+                        if isinstance(function.get("name"), str):
+                            entry["function"]["name"] += function["name"]
+                        if isinstance(function.get("arguments"), str):
+                            entry["function"]["arguments"] += function["arguments"]
+        finally:
+            getattr(response, "close", lambda: None)()
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
+        if calls:
+            message["tool_calls"] = [calls[index] for index in sorted(calls)]
+        return message
+
+    def _complete_stream_responses(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        on_delta: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        endpoint = self._endpoint(self.config.base_url, "/responses")
+        body = {
+            "model": self.config.model,
+            "input": self._responses_input(messages),
+            "tools": self._responses_tools(tools),
+            "store": False,
+            "stream": True,
+        }
+        self._debug("model_request", {"endpoint": endpoint, "body": body})
+        response = self._stream_request(endpoint, body, self.api_key, self.config.request_timeout)
+        content_parts: list[str] = []
+        calls: dict[str, dict[str, Any]] = {}
+        final_response: dict[str, Any] | None = None
+        try:
+            for payload in self._sse_payloads(response):
+                self._record_usage(payload)
+                self._debug("model_chunk", payload)
+                event_type = payload.get("type")
+                if event_type == "response.output_text.delta":
+                    delta = payload.get("delta")
+                    if isinstance(delta, str):
+                        content_parts.append(delta)
+                        if on_delta:
+                            on_delta(delta)
+                elif event_type == "response.output_item.added":
+                    item = payload.get("item")
+                    if isinstance(item, dict) and item.get("type") == "function_call":
+                        key = str(item.get("call_id") or item.get("id") or len(calls))
+                        calls[key] = {
+                            "id": item.get("call_id") or item.get("id", key),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name") or "",
+                                "arguments": item.get("arguments") or "",
+                            },
+                        }
+                elif event_type == "response.function_call_arguments.delta":
+                    key = str(payload.get("call_id") or payload.get("item_id") or len(calls))
+                    if key not in calls and len(calls) == 1:
+                        key = next(iter(calls))
+                    entry = calls.setdefault(key, {
+                        "id": payload.get("call_id", key),
+                        "type": "function",
+                        "function": {"name": payload.get("name") or "", "arguments": ""},
+                    })
+                    delta = payload.get("delta") or payload.get("arguments")
+                    if isinstance(delta, str):
+                        entry["function"]["arguments"] += delta
+                elif event_type == "response.completed" and isinstance(payload.get("response"), dict):
+                    final_response = payload["response"]
+                elif isinstance(payload.get("output"), list):
+                    # Some OpenAI-compatible relays ignore stream=true and return
+                    # one ordinary Responses payload instead of SSE events.
+                    final_response = payload
+                elif isinstance(payload.get("output_text"), str) and not content_parts:
+                    content_parts.append(payload["output_text"])
+                    if on_delta:
+                        on_delta(payload["output_text"])
+        finally:
+            getattr(response, "close", lambda: None)()
+        if final_response:
+            final_message = self._responses_message(final_response)
+            if not content_parts and final_message.get("content"):
+                content = final_message["content"]
+                content_parts.append(content)
+                if on_delta:
+                    on_delta(content)
+            if not calls:
+                for call in final_message.get("tool_calls") or []:
+                    calls[str(call.get("id", len(calls)))] = call
+        message = {"role": "assistant", "content": "".join(content_parts)}
+        if calls:
+            message["tool_calls"] = list(calls.values())
+        return message
+
+    def complete_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        on_delta: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Complete a turn while forwarding assistant text deltas as they arrive."""
+        if self.api_mode == "responses":
+            return self._complete_stream_responses(messages, tools, on_delta)
+        if self.api_mode == "chat":
+            return self._complete_stream_chat(messages, tools, on_delta)
+        try:
+            return self._complete_stream_chat(messages, tools, on_delta)
+        except ModelError as exc:
+            if getattr(exc, "status_code", None) not in {404, 405}:
+                raise
+            return self._complete_stream_responses(messages, tools, on_delta)
+
     def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         if self.api_mode == "responses":
             return self._complete_responses(messages, tools)
@@ -284,6 +549,7 @@ class Workspace:
         self.approve = approve or (lambda _: False)
         self.config = config or AgentConfig()
         self.audit_path = self.resolve(audit_path) if audit_path else None
+        self.last_full_result: str | None = None
 
     def _audit(self, event: str, **data: Any) -> None:
         if not self.audit_path:
@@ -310,7 +576,9 @@ class Workspace:
             if item.name in {".git", ".venv", "node_modules", "__pycache__"}:
                 continue
             entries.append(f"{item.relative_to(self.root)}{'/' if item.is_dir() else ''}")
-        return "\n".join(entries) or "(empty)"
+        result = "\n".join(entries) or "(empty)"
+        self.last_full_result = result
+        return result
 
     def read_file(self, path: str, start_line: int = 1, end_line: int | None = None) -> str:
         file = self.resolve(path)
@@ -325,13 +593,16 @@ class Workspace:
         if first > last:
             return ""
         shown = [f"{i:>5} | {lines[i - 1]}" for i in range(first, min(last, len(lines)) + 1)]
-        return "\n".join(shown)[: self.config.max_output_chars]
+        result = "\n".join(shown)
+        self.last_full_result = result
+        return result[: self.config.max_output_chars]
 
     def search_files(self, query: str, path: str = ".") -> str:
         base = self.resolve(path)
         if not base.is_dir():
             raise AgentError(f"not a directory: {path}")
         results: list[str] = []
+        limit_reached = False
         for file in base.rglob("*"):
             if not file.is_file() or any(part in {".git", ".venv", "node_modules", "__pycache__"} for part in file.parts):
                 continue
@@ -340,21 +611,65 @@ class Workspace:
                     if query.lower() in line.lower():
                         results.append(f"{file.relative_to(self.root)}:{number}: {line.strip()}")
                         if len(results) >= 100:
-                            return "\n".join(results) + "\n(results truncated)"
+                            limit_reached = True
+                            break
             except (UnicodeDecodeError, OSError):
                 continue
-        return "\n".join(results) or "(no matches)"
+            if limit_reached:
+                break
+        result = "\n".join(results) or "(no matches)"
+        if limit_reached:
+            result += "\n(results truncated)"
+        self.last_full_result = result
+        return result
+
+    def preview(self, name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+        """Build a read-only preview for an edit before the approval callback runs."""
+        if name == "apply_patch":
+            patch = arguments.get("patch")
+            if not isinstance(patch, str):
+                return None
+            if patch.lstrip().startswith("```"):
+                fenced = patch.lstrip().splitlines(keepends=True)
+                if len(fenced) >= 3 and fenced[-1].strip().startswith("```"):
+                    patch = "".join(fenced[1:-1])
+            return {"kind": "diff", "path": arguments.get("path", ""), "diff": patch}
+        if name != "write_file" or not isinstance(arguments.get("content"), str):
+            return None
+        relative = arguments.get("path", "")
+        file = self.resolve(relative)
+        old: list[str] = []
+        if file.exists():
+            if not file.is_file():
+                raise AgentError(f"not a file: {relative}")
+            try:
+                old = file.read_text(encoding="utf-8").splitlines(keepends=True)
+            except UnicodeDecodeError as exc:
+                raise AgentError("only UTF-8 text files are supported") from exc
+        new = arguments["content"].splitlines(keepends=True)
+        diff = "".join(difflib.unified_diff(
+            old,
+            new,
+            fromfile=f"a/{relative}",
+            tofile=f"b/{relative}",
+            lineterm="\n",
+        ))
+        return {"kind": "diff", "path": relative, "diff": diff or "(no textual changes)"}
 
     def write_file(self, path: str, content: str) -> str:
         file = self.resolve(path)
         prompt = f"write {file.relative_to(self.root)} ({len(content)} chars)"
         if not self.approve(prompt):
             self._audit("denied", action=prompt)
-            return "DENIED: user did not approve file write"
+            result = "DENIED: user did not approve file write"
+            self.last_full_result = result
+            return result
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_text(content, encoding="utf-8")
         self._audit("write_file", path=str(file.relative_to(self.root)), chars=len(content))
-        return f"wrote {file.relative_to(self.root)} ({len(content)} chars)"
+        result = f"wrote {file.relative_to(self.root)} ({len(content)} chars)"
+        self.last_full_result = result
+        return result
 
     def apply_patch(self, path: str, patch: str) -> str:
         file = self.resolve(path)
@@ -366,10 +681,14 @@ class Workspace:
             raise AgentError("patch did not change file")
         if not self.approve(f"patch {file.relative_to(self.root)}"):
             self._audit("denied", action=f"patch {file.relative_to(self.root)}")
-            return "DENIED: user did not approve patch"
+            result = "DENIED: user did not approve patch"
+            self.last_full_result = result
+            return result
         file.write_text("".join(new), encoding="utf-8")
         self._audit("apply_patch", path=str(file.relative_to(self.root)))
-        return f"patched {file.relative_to(self.root)}"
+        result = f"patched {file.relative_to(self.root)}"
+        self.last_full_result = result
+        return result
 
     @staticmethod
     def _apply_unified_diff(old: list[str], patch: str) -> list[str]:
@@ -425,22 +744,31 @@ class Workspace:
             raise AgentError("command is empty")
         if self.BLOCKED_COMMANDS.search(command):
             self._audit("blocked", action=command, reason="destructive command")
-            return "DENIED: destructive command is blocked"
+            result = "DENIED: destructive command is blocked"
+            self.last_full_result = result
+            return result
         # Keep shell use explicit and visible; approval is required for every invocation.
         if not self.approve(f"run command: {command}"):
             self._audit("denied", action=command)
-            return "DENIED: user did not approve command"
+            result = "DENIED: user did not approve command"
+            self.last_full_result = result
+            return result
         try:
             result = subprocess.run(command, cwd=self.root, shell=True, capture_output=True, text=True, errors="replace",
                                     timeout=min(timeout or self.config.command_timeout, 120))
         except subprocess.TimeoutExpired as exc:
-            return f"TIMEOUT after {exc.timeout}s"
+            result = f"TIMEOUT after {exc.timeout}s"
+            self.last_full_result = result
+            return result
         output = (result.stdout + ("\n" + result.stderr if result.stderr else "")).strip()
-        output = output[-self.config.max_output_chars:]
+        full_result = f"exit_code={result.returncode}\n{output}" if output else f"exit_code={result.returncode}"
+        self.last_full_result = full_result
+        bounded_output = output[-self.config.max_output_chars:]
         self._audit("run_command", command=command, exit_code=result.returncode)
-        return f"exit_code={result.returncode}\n{output}" if output else f"exit_code={result.returncode}"
+        return f"exit_code={result.returncode}\n{bounded_output}" if bounded_output else f"exit_code={result.returncode}"
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        self.last_full_result = None
         methods = {"list_files": self.list_files, "read_file": self.read_file, "search_files": self.search_files,
                    "write_file": self.write_file, "apply_patch": self.apply_patch, "run_command": self.run_command}
         if name not in methods:
@@ -499,33 +827,140 @@ class CodingAgent:
         self.messages = [system] + [message for turn in kept_turns for message in turn]
         self._checkpoint()
 
-    def run(self, task: str, on_event: Callable[[str], None] | None = None) -> str:
+    @staticmethod
+    def _tool_ok(name: str, result: str) -> bool:
+        if result.startswith(("ERROR:", "DENIED", "TIMEOUT")):
+            return False
+        if name == "run_command":
+            match = re.match(r"exit_code=(-?\d+)", result)
+            if match and int(match.group(1)) != 0:
+                return False
+        return True
+
+    def _run_end(self, emit: EventHandler, steps: int, started_at: float, result: str,
+                 usage_before: dict[str, int]) -> None:
+        usage = getattr(self.client, "total_usage", {})
+        usage_delta = {
+            key: int(value) - usage_before.get(key, 0)
+            for key, value in usage.items()
+            if isinstance(value, (int, float)) and int(value) - usage_before.get(key, 0) > 0
+        } if isinstance(usage, dict) else {}
+        emit(("run_end", {
+            "steps": steps,
+            "elapsed": time.perf_counter() - started_at,
+            "result": result,
+            "usage": usage_delta,
+        }))
+
+    def run(self, task: str, on_event: EventHandler | None = None) -> str:
         emit = on_event or (lambda _: None)
+        started_at = time.perf_counter()
+        usage_before = dict(getattr(self.client, "total_usage", {}) or {})
         self._append_message({"role": "user", "content": task})
         for step in range(1, self.config.max_steps + 1):
             self._trim_context()
-            emit(f"step {step}/{self.config.max_steps}: thinking")
-            assistant = self.client.complete(self.messages, TOOL_SCHEMAS)
+            emit(("thinking", {"step": step, "max_steps": self.config.max_steps}))
+            streamed = False
+            stream_complete = getattr(self.client, "complete_stream", None)
+            previous_debug = getattr(self.client, "debug_handler", None)
+            if hasattr(self.client, "debug_handler"):
+                self.client.debug_handler = lambda kind, payload: emit((kind, payload))
+            try:
+                if callable(stream_complete):
+                    streamed = True
+                    assistant = stream_complete(
+                        self.messages,
+                        TOOL_SCHEMAS,
+                        on_delta=lambda text: emit(("assistant_delta", text)),
+                    )
+                else:
+                    assistant = self.client.complete(self.messages, TOOL_SCHEMAS)
+            finally:
+                if hasattr(self.client, "debug_handler"):
+                    self.client.debug_handler = previous_debug
+            if not isinstance(assistant, dict):
+                raise ModelError(f"model returned an invalid assistant message: {assistant!r}")
             tool_calls = assistant.get("tool_calls") or []
             content = assistant.get("content") or ""
+            if not streamed and isinstance(content, str) and content:
+                emit(("assistant_delta", content))
             self._append_message({"role": "assistant", "content": content, **({"tool_calls": tool_calls} if tool_calls else {})})
             if not tool_calls:
-                return content.strip() or "完成。"
+                result = content.strip() or "完成。"
+                if not content:
+                    emit(("assistant_delta", result))
+                self._run_end(emit, step, started_at, result, usage_before)
+                return result
             for call in tool_calls:
-                function = call.get("function", {})
-                name = function.get("name", "")
-                raw_args = function.get("arguments", {})
+                function = call.get("function", {}) if isinstance(call, dict) else {}
+                name = function.get("name", "") if isinstance(function, dict) else ""
+                raw_args = function.get("arguments", {}) if isinstance(function, dict) else {}
+                tool_id = call.get("id", name) if isinstance(call, dict) else name
+                emit(("tool_call", {"name": name, "arguments": raw_args, "tool_call_id": tool_id, "raw": call}))
                 try:
                     arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                     if not isinstance(arguments, dict):
                         raise ValueError("arguments must be an object")
-                    emit(f"tool {name}: {arguments}")
+                except Exception as exc:
+                    emit(("tool_start", {"name": name, "arguments": raw_args, "tool_call_id": tool_id}))
+                    error = str(exc)
+                    emit(("tool_end", {
+                        "name": name,
+                        "arguments": raw_args,
+                        "tool_call_id": tool_id,
+                        "ok": False,
+                        "error": error,
+                        "result": f"ERROR: {error}",
+                        "elapsed": 0.0,
+                    }))
+                    result = f"ERROR: {error}"
+                    self.workspace._audit("tool_error", tool=name, error=error)
+                    self._append_message({"role": "tool", "tool_call_id": tool_id, "content": result})
+                    continue
+
+                preview: dict[str, Any] | None = None
+                preview_error: str | None = None
+                try:
+                    preview = self.workspace.preview(name, arguments)
+                except Exception as exc:
+                    preview_error = str(exc)
+                emit(("tool_start", {
+                    "name": name,
+                    "arguments": arguments,
+                    "tool_call_id": tool_id,
+                    "preview": preview,
+                    "preview_error": preview_error,
+                }))
+                tool_started_at = time.perf_counter()
+                try:
                     result = self.workspace.execute(name, arguments)
+                    ok = self._tool_ok(name, result)
+                    if ok:
+                        error = None
+                    elif name == "run_command" and result.startswith("exit_code="):
+                        error = result.split("\n", 1)[0].replace("exit_code=", "exit ")
+                    else:
+                        error = result.split("\n", 1)[0].removeprefix("ERROR:").strip() or result.split("\n", 1)[0]
                 except Exception as exc:  # tool failures are recoverable model observations
                     result = f"ERROR: {exc}"
-                    self.workspace._audit("tool_error", tool=name, error=str(exc))
-                self._append_message({"role": "tool", "tool_call_id": call.get("id", name), "content": result})
-        return "达到最大步骤数，任务尚未确认完成。请检查工作区后继续。"
+                    ok = False
+                    error = str(exc)
+                    self.workspace._audit("tool_error", tool=name, error=error)
+                emit(("tool_end", {
+                    "name": name,
+                    "arguments": arguments,
+                    "tool_call_id": tool_id,
+                    "ok": ok,
+                    "error": error,
+                    "result": result,
+                    "full_result": self.workspace.last_full_result,
+                    "elapsed": time.perf_counter() - tool_started_at,
+                }))
+                self._append_message({"role": "tool", "tool_call_id": tool_id, "content": result})
+        result = "达到最大步骤数，任务尚未确认完成。请检查工作区后继续。"
+        emit(("assistant_delta", result))
+        self._run_end(emit, self.config.max_steps, started_at, result, usage_before)
+        return result
 
 
 def make_agent(root: str | Path, config: AgentConfig | None = None, approve: Callable[[str], bool] | None = None,
