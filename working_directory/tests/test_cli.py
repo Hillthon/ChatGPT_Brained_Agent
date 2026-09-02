@@ -1,6 +1,7 @@
 import io
 import sys
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -16,6 +17,16 @@ class FakeAgent:
         self.messages = messages or [{"role": "system", "content": SYSTEM_PROMPT}]
         self.checkpoint = checkpoint
         self.tasks = tasks
+        self.workspace = SimpleNamespace(
+            undo_last=lambda: SimpleNamespace(id="a" * 32, task_id="t" * 32, tool="write_file", path="x.py"),
+            rollback_latest_task=lambda: (
+                SimpleNamespace(id="t" * 32),
+                [SimpleNamespace(id="a" * 32, task_id="t" * 32, tool="write_file", path="x.py")],
+            ),
+            undo_checkpoints=lambda: [
+                SimpleNamespace(id="a" * 32, task_id="t" * 32, tool="write_file", path="x.py")
+            ],
+        )
 
     def run(self, task, on_event=None):
         self.tasks.append(task)
@@ -25,6 +36,10 @@ class FakeAgent:
         ])
         self.checkpoint(self.messages)
         return f"done: {task}"
+
+    def record_control_event(self, content):
+        self.messages.append({"role": "system", "content": content})
+        self.checkpoint(self.messages)
 
 
 class CLITests(unittest.TestCase):
@@ -39,7 +54,8 @@ class CLITests(unittest.TestCase):
                 return FakeAgent(kwargs.get("messages"), kwargs["on_history_change"], tasks)
 
             argv = [
-                "cli.py", "--root", str(root), "--session-dir", str(sessions), "first task",
+                "cli.py", "--root", str(root), "--session-dir", str(sessions),
+                "--undo-dir", str(Path(directory) / "snapshots"), "first task",
             ]
             with patch.object(sys, "argv", argv), \
                     patch("cli.make_agent", side_effect=fake_make_agent), \
@@ -66,6 +82,7 @@ class CLITests(unittest.TestCase):
 
             argv = [
                 "cli.py", "--root", str(root), "--session-dir", str(Path(directory) / "sessions"),
+                "--undo-dir", str(Path(directory) / "snapshots"),
                 "--once", "only task",
             ]
             with patch.object(sys, "argv", argv), \
@@ -87,7 +104,8 @@ class CLITests(unittest.TestCase):
                 return FakeAgent(kwargs.get("messages"), kwargs["on_history_change"], tasks)
 
             argv = [
-                "cli.py", "--root", str(root), "--session-dir", str(sessions), "first task",
+                "cli.py", "--root", str(root), "--session-dir", str(sessions),
+                "--undo-dir", str(Path(directory) / "snapshots"), "first task",
             ]
             with patch.object(sys, "argv", argv), \
                     patch("cli.make_agent", side_effect=fake_make_agent), \
@@ -123,6 +141,7 @@ class CLITests(unittest.TestCase):
 
             argv = [
                 "cli.py", "--root", str(root), "--session-dir", str(sessions),
+                "--undo-dir", str(Path(directory) / "snapshots"),
                 "--session", saved.id, "--once", "follow-up task",
             ]
             with patch.object(sys, "argv", argv), \
@@ -135,6 +154,39 @@ class CLITests(unittest.TestCase):
                 message["content"] for message in restored.messages if message["role"] == "user"
             ]
             self.assertEqual(user_messages, ["old task", "follow-up task"])
+
+    def test_cli_undo_rollback_and_checkpoints_commands(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            tasks = []
+
+            def fake_make_agent(*args, **kwargs):
+                return FakeAgent(kwargs.get("messages"), kwargs["on_history_change"], tasks)
+
+            argv = [
+                "cli.py", "--root", str(root),
+                "--session-dir", str(Path(directory) / "sessions"),
+                "--undo-dir", str(Path(directory) / "snapshots"),
+            ]
+            output = io.StringIO()
+            with patch.object(sys, "argv", argv), \
+                    patch("cli.make_agent", side_effect=fake_make_agent), \
+                    patch("builtins.input", side_effect=["/checkpoints", "/undo", "/rollback", "/exit"]), \
+                    redirect_stdout(output):
+                self.assertEqual(cli.main(), 0)
+
+            rendered = output.getvalue()
+            self.assertIn("aaaaaaaa", rendered)
+            self.assertIn("Undid write_file: x.py", rendered)
+            self.assertIn("Rolled back 1 edit(s)", rendered)
+            saved = SessionStore(Path(directory) / "sessions").list_sessions(root)
+            self.assertEqual(len(saved), 1)
+            control_events = [
+                message["content"] for message in saved[0].messages
+                if message["role"] == "system" and "Undid" in message["content"]
+            ]
+            self.assertEqual(len(control_events), 1)
 
 
 if __name__ == "__main__":

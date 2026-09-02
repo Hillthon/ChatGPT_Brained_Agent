@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from agent import AgentConfig, AgentError, CodingAgent, ModelError, OpenAICompatibleClient, TOOL_SCHEMAS, Workspace
+from undo import UndoManager
 
 
 class FakeClient:
@@ -103,6 +104,91 @@ class AgentTests(unittest.TestCase):
             agent = CodingAgent(FakeClient(replies), workspace)
             self.assertEqual(agent.run("create x"), "done")
             self.assertEqual((Path(directory) / "x.txt").read_text(), "ok")
+
+    def test_agent_file_tools_create_persistent_undo_checkpoints(self):
+        replies = [
+            {"content": "", "tool_calls": [{"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "x.txt", "content": "after"})}}]},
+            {"content": "done", "tool_calls": []},
+        ]
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            file = root / "x.txt"
+            file.write_text("before", encoding="utf-8")
+            manager = UndoManager(Path(directory) / "snapshots", "session-1", root)
+            workspace = Workspace(root, approve=lambda _: True, undo_manager=manager)
+            agent = CodingAgent(FakeClient(replies), workspace)
+
+            self.assertEqual(agent.run("edit x"), "done")
+            self.assertEqual(file.read_text(encoding="utf-8"), "after")
+            self.assertEqual(len(workspace.undo_checkpoints()), 1)
+
+            action = workspace.undo_last()
+            self.assertEqual(action.tool, "write_file")
+            self.assertEqual(file.read_text(encoding="utf-8"), "before")
+
+    def test_agent_undo_and_task_rollback_end_to_end(self):
+        replies = [
+            {"content": "", "tool_calls": [{"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "app.txt", "content": "first"})}}]},
+            {"content": "first task done", "tool_calls": []},
+            {"content": "", "tool_calls": [{"id": "2", "function": {"name": "write_file", "arguments": json.dumps({"path": "app.txt", "content": "second"})}}]},
+            {"content": "", "tool_calls": [{"id": "3", "function": {"name": "write_file", "arguments": json.dumps({"path": "new.txt", "content": "created"})}}]},
+            {"content": "second task done", "tool_calls": []},
+        ]
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            existing = root / "app.txt"
+            created = root / "new.txt"
+            existing.write_text("original", encoding="utf-8")
+            manager = UndoManager(Path(directory) / "snapshots", "session-1", root)
+            workspace = Workspace(root, approve=lambda _: True, undo_manager=manager)
+            agent = CodingAgent(FakeClient(replies), workspace)
+
+            self.assertEqual(agent.run("first edit"), "first task done")
+            self.assertEqual(len(workspace.undo_checkpoints()), 1)
+            workspace.undo_last()
+            self.assertEqual(existing.read_text(encoding="utf-8"), "original")
+
+            self.assertEqual(agent.run("edit and create"), "second task done")
+            self.assertEqual(existing.read_text(encoding="utf-8"), "second")
+            self.assertEqual(created.read_text(encoding="utf-8"), "created")
+            task, actions = workspace.rollback_latest_task()
+            self.assertEqual(len(actions), 2)
+            self.assertEqual(task.prompt, "edit and create")
+            self.assertEqual(existing.read_text(encoding="utf-8"), "original")
+            self.assertFalse(created.exists())
+            self.assertEqual(workspace.undo_checkpoints(), [])
+
+    def test_denied_write_does_not_create_an_undo_checkpoint(self):
+        replies = [
+            {"content": "", "tool_calls": [{"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "x.txt", "content": "after"})}}]},
+            {"content": "denied", "tool_calls": []},
+        ]
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            manager = UndoManager(Path(directory) / "snapshots", "session-1", root)
+            workspace = Workspace(root, approve=lambda _: False, undo_manager=manager)
+            CodingAgent(FakeClient(replies), workspace).run("edit x")
+            self.assertEqual(workspace.undo_checkpoints(), [])
+            self.assertFalse((root / "x.txt").exists())
+
+    def test_failed_patch_does_not_create_an_undo_checkpoint(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            file = root / "x.txt"
+            file.write_text("before\n", encoding="utf-8")
+            manager = UndoManager(Path(directory) / "snapshots", "session-1", root)
+            manager.begin_task("bad patch")
+            workspace = Workspace(root, approve=lambda _: True, undo_manager=manager)
+
+            with self.assertRaises(AgentError):
+                workspace.apply_patch("x.txt", "not a unified diff")
+
+            self.assertEqual(file.read_text(encoding="utf-8"), "before\n")
+            self.assertEqual(workspace.undo_checkpoints(), [])
 
     def test_agent_emits_structured_events(self):
         replies = [

@@ -10,6 +10,7 @@ import json
 import difflib
 import os
 import re
+import stat
 import subprocess
 import time
 import urllib.error
@@ -544,12 +545,58 @@ class Workspace:
     )
 
     def __init__(self, root: str | Path, approve: Callable[[str], bool] | None = None,
-                 config: AgentConfig | None = None, audit_path: str | Path | None = None):
+                 config: AgentConfig | None = None, audit_path: str | Path | None = None,
+                 undo_manager: Any | None = None):
         self.root = Path(root).resolve()
         self.approve = approve or (lambda _: False)
         self.config = config or AgentConfig()
         self.audit_path = self.resolve(audit_path) if audit_path else None
         self.last_full_result: str | None = None
+        self.undo_manager = undo_manager
+
+    def begin_undo_task(self, prompt: str) -> str | None:
+        return self.undo_manager.begin_task(prompt) if self.undo_manager else None
+
+    def finish_undo_task(self, task_id: str | None, status: str) -> None:
+        if self.undo_manager:
+            self.undo_manager.finish_task(task_id, status)
+
+    def undo_last(self) -> Any:
+        if not self.undo_manager:
+            raise AgentError("undo is not configured for this agent")
+        action = self.undo_manager.undo_last()
+        self._audit("undo", action_id=action.id, task_id=action.task_id, path=action.path, tool=action.tool)
+        return action
+
+    def rollback_latest_task(self) -> tuple[Any, list[Any]]:
+        if not self.undo_manager:
+            raise AgentError("undo is not configured for this agent")
+        task, actions = self.undo_manager.rollback_latest_task()
+        self._audit("rollback_task", task_id=task.id, paths=[action.path for action in actions])
+        return task, actions
+
+    def undo_checkpoints(self) -> list[Any]:
+        return self.undo_manager.active_actions() if self.undo_manager else []
+
+    @staticmethod
+    def _write_text_atomic(file: Path, content: str) -> None:
+        mode = stat.S_IMODE(file.stat().st_mode) if file.exists() else None
+        temporary = file.with_name(f".{file.name}.{os.urandom(8).hex()}.tmp")
+        try:
+            temporary.write_text(content, encoding="utf-8")
+            if mode is not None:
+                try:
+                    temporary.chmod(mode)
+                except OSError:
+                    pass
+            temporary.replace(file)
+            if mode is not None:
+                try:
+                    file.chmod(mode)
+                except OSError:
+                    pass
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _audit(self, event: str, **data: Any) -> None:
         if not self.audit_path:
@@ -664,10 +711,14 @@ class Workspace:
             result = "DENIED: user did not approve file write"
             self.last_full_result = result
             return result
+        pending = self.undo_manager.capture(file, "write_file") if self.undo_manager else None
         file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text(content, encoding="utf-8")
+        self._write_text_atomic(file, content)
+        action = self.undo_manager.commit(pending) if self.undo_manager and pending else None
         self._audit("write_file", path=str(file.relative_to(self.root)), chars=len(content))
         result = f"wrote {file.relative_to(self.root)} ({len(content)} chars)"
+        if action:
+            result += f" [undo {action.id[:8]}]"
         self.last_full_result = result
         return result
 
@@ -684,9 +735,13 @@ class Workspace:
             result = "DENIED: user did not approve patch"
             self.last_full_result = result
             return result
-        file.write_text("".join(new), encoding="utf-8")
+        pending = self.undo_manager.capture(file, "apply_patch") if self.undo_manager else None
+        self._write_text_atomic(file, "".join(new))
+        action = self.undo_manager.commit(pending) if self.undo_manager and pending else None
         self._audit("apply_patch", path=str(file.relative_to(self.root)))
         result = f"patched {file.relative_to(self.root)}"
+        if action:
+            result += f" [undo {action.id[:8]}]"
         self.last_full_result = result
         return result
 
@@ -748,7 +803,7 @@ class Workspace:
             self.last_full_result = result
             return result
         # Keep shell use explicit and visible; approval is required for every invocation.
-        if not self.approve(f"run command: {command}"):
+        if not self.approve(f"run command (not covered by file rollback): {command}"):
             self._audit("denied", action=command)
             result = "DENIED: user did not approve command"
             self.last_full_result = result
@@ -803,6 +858,10 @@ class CodingAgent:
         self.messages.append(message)
         self._checkpoint()
 
+    def record_control_event(self, content: str) -> None:
+        """Keep local undo operations visible to subsequent model turns."""
+        self._append_message({"role": "system", "content": f"Local workspace event: {content}"})
+
     def _trim_context(self) -> None:
         serialized = json.dumps(self.messages, ensure_ascii=False)
         if len(serialized) <= self.config.max_context_chars:
@@ -853,6 +912,16 @@ class CodingAgent:
         }))
 
     def run(self, task: str, on_event: EventHandler | None = None) -> str:
+        undo_task_id = self.workspace.begin_undo_task(task)
+        try:
+            result = self._run_task(task, on_event)
+        except BaseException:
+            self.workspace.finish_undo_task(undo_task_id, "interrupted")
+            raise
+        self.workspace.finish_undo_task(undo_task_id, "completed")
+        return result
+
+    def _run_task(self, task: str, on_event: EventHandler | None = None) -> str:
         emit = on_event or (lambda _: None)
         started_at = time.perf_counter()
         usage_before = dict(getattr(self.client, "total_usage", {}) or {})
@@ -966,8 +1035,9 @@ class CodingAgent:
 def make_agent(root: str | Path, config: AgentConfig | None = None, approve: Callable[[str], bool] | None = None,
                audit_path: str | Path | None = None, api_key: str | None = None,
                messages: list[dict[str, Any]] | None = None,
-               on_history_change: Callable[[list[dict[str, Any]]], None] | None = None) -> CodingAgent:
+               on_history_change: Callable[[list[dict[str, Any]]], None] | None = None,
+               undo_manager: Any | None = None) -> CodingAgent:
     cfg = config or AgentConfig()
     client = OpenAICompatibleClient(cfg, api_key=api_key)
-    workspace = Workspace(root, approve=approve, config=cfg, audit_path=audit_path)
+    workspace = Workspace(root, approve=approve, config=cfg, audit_path=audit_path, undo_manager=undo_manager)
     return CodingAgent(client, workspace, cfg, messages=messages, on_history_change=on_history_change)
