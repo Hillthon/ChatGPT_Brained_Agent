@@ -5,7 +5,7 @@
 ## 迭代阶段
 
 1. **最小闭环**：`OpenAICompatibleClient` 发送 OpenAI 兼容的 Chat Completions/Responses 请求，`CodingAgent.run` 保存统一消息格式、解析 `tool_calls`，调用本地工具，直到模型返回普通文本。
-2. **真实编程工具**：加入目录浏览、带行号读取、文本搜索、整文件写入、单文件 unified diff 和命令执行。
+2. **真实编程工具**：加入目录浏览、带行号读取、PDF/DOCX 文档提取、文本搜索、整文件写入、单文件 unified diff 和命令执行。
 3. **安全边界**：所有路径通过 `Path.resolve()` 限制在 workspace；写入、补丁和命令逐次确认；拦截常见破坏性命令；命令超时且截断输出。
 4. **可靠性**：工具异常作为 `ERROR` 观察结果回传模型；最大步骤数防止死循环；上下文按完整对话组裁剪；可选 JSONL 审计日志记录副作用。
 5. **连续对话与会话**：CLI 在单个任务完成后继续接收输入；`SessionStore` 将多个独立消息历史持久化，并支持列出、新建、恢复和切换。
@@ -25,6 +25,13 @@ session -> 用户任务 -> 模型 <-> 本地工具循环 -> 最终回答
 `CodingAgent.run()` 发出 `("thinking", {...})`、`("tool_call", {...})`、`("tool_start", {...})`、`("tool_end", {...})`、`("assistant_delta", text)`、`("verification_required", {...})`、`("completion_rejected", {...})` 和 `("run_end", {...})`。模型客户端的 `model_request`、`model_response`、`model_chunk` 事件只在 `-vv` 显示。这样工具执行逻辑不依赖终端格式，CLI 也不会把裸参数、session JSON 或 API payload 混入默认输出。
 
 模型没有本地文件系统或代码执行权限。它只能请求 `TOOL_SCHEMAS` 中列出的操作，实际副作用由 `Workspace` 完成，因此不依赖服务端 Code Interpreter 或 Files API。
+
+## 文档读取
+
+- `read_pdf` 通过 `pypdf` 在 workspace 内按 1-based 页码提取文本，并在结果中加入 `[Page N]` 标记。传入 `include_images=true` 时，使用 PyMuPDF 或系统 `pdftoppm` 渲染页面；没有文本层的扫描 PDF 会走这个视觉路径，而不是假装 OCR 成功。
+- `read_docx` 读取 DOCX 的 OOXML `word/document.xml`，按文档顺序提取普通段落和表格，分别加入 `[Paragraph N]`、`[Table N]` 标记；`include_images=true` 时读取 `word/media/` 内嵌图片。
+- `read_image` 校验并读取 workspace 内的 PNG、JPEG、WEBP、GIF、BMP 或 TIFF 图片，必要时缩放/压缩后作为 data URL 附加到下一轮模型请求。图片大小和数量均有限制，避免上下文失控。
+- 文档和图片以受控只读工具暴露给模型；工具结果中的图像只会作为多模态输入发送给模型，不允许模型通过任意命令自行读取 workspace 外文件。中转模型必须支持 vision，Responses API 会自动把 Chat 格式的 `image_url` 转换成 `input_image`。
 
 ## 会话边界
 

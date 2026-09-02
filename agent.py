@@ -8,18 +8,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import base64
 import difflib
+import io
 import os
 import re
+import shutil
 import stat
 import subprocess
 import time
+import mimetypes
 import urllib.error
 import urllib.request
+import zipfile
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
+import xml.etree.ElementTree as ET
 
 
 AgentEvent = tuple[str, Any]
@@ -43,6 +49,13 @@ class AgentConfig:
         or os.environ.get("OPENAI_BASE_URL")
         or "https://rightapi.ai/codex/v1"
     ))
+    max_steps: int = 1000
+    max_context_chars: int = 80_0000
+    command_timeout: int = 30
+    max_output_chars: int = 12_0000
+    max_image_bytes: int = 2_000_000
+    max_image_dimension: int = 2048
+    max_image_pages: int = 4
     max_steps: int = 100
     max_context_chars: int = 80_000
     max_context_tokens: int = 32_000
@@ -263,6 +276,25 @@ class OpenAICompatibleClient:
 
     @staticmethod
     def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        def convert_content(content: Any) -> Any:
+            if not isinstance(content, list):
+                return content
+            converted: list[dict[str, Any]] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                kind = part.get("type")
+                if kind == "text":
+                    converted.append({"type": "input_text", "text": part.get("text", "")})
+                elif kind == "image_url":
+                    image = part.get("image_url")
+                    if isinstance(image, dict):
+                        item: dict[str, Any] = {"type": "input_image", "image_url": image.get("url", "")}
+                        if image.get("detail"):
+                            item["detail"] = image["detail"]
+                        converted.append(item)
+            return converted
+
         converted: list[dict[str, Any]] = []
         for message in messages:
             role = message.get("role")
@@ -284,7 +316,7 @@ class OpenAICompatibleClient:
                     "output": message.get("content", ""),
                 })
             else:
-                converted.append({"role": role, "content": message.get("content", "")})
+                converted.append({"role": role, "content": convert_content(message.get("content", ""))})
         return converted
 
     @staticmethod
@@ -538,6 +570,9 @@ def _json_schema(type_: str, description: str, **properties: Any) -> dict[str, A
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     _json_schema("list_files", "List files under a workspace-relative directory.", path={"type": "string", "description": "Relative directory", "default": "."}),
     _json_schema("read_file", "Read a UTF-8 text file with line numbers.", path={"type": "string"}, start_line={"type": "integer", "minimum": 1, "default": 1}, end_line={"type": ["integer", "null"], "minimum": 1, "default": None}),
+    _json_schema("read_image", "Read a workspace image so a vision-capable model can inspect it.", path={"type": "string"}, detail={"type": "string", "enum": ["low", "auto", "high"], "default": "auto"}),
+    _json_schema("read_pdf", "Extract text from a workspace PDF and optionally attach rendered pages for visual analysis.", path={"type": "string"}, start_page={"type": "integer", "minimum": 1, "default": 1}, end_page={"type": ["integer", "null"], "minimum": 1, "default": None}, include_images={"type": "boolean", "default": False}),
+    _json_schema("read_docx", "Extract paragraphs and tables from a workspace DOCX and optionally attach embedded images.", path={"type": "string"}, start_paragraph={"type": "integer", "minimum": 1, "default": 1}, end_paragraph={"type": ["integer", "null"], "minimum": 1, "default": None}, include_images={"type": "boolean", "default": False}),
     _json_schema("search_files", "Search text in UTF-8 files below a directory.", query={"type": "string"}, path={"type": "string", "default": "."}),
     _json_schema("write_file", "Create or replace a UTF-8 file. Use only when the user requested a change.", path={"type": "string"}, content={"type": "string"}),
     _json_schema("apply_patch", "Apply a unified diff to one workspace-relative file.", path={"type": "string"}, patch={"type": "string"}),
@@ -563,6 +598,7 @@ class Workspace:
         self.config = config or AgentConfig()
         self.audit_path = self.resolve(audit_path) if audit_path else None
         self.last_full_result: str | None = None
+        self.last_images: list[dict[str, Any]] = []
         self.undo_manager = undo_manager
 
     def begin_undo_task(self, prompt: str) -> str | None:
@@ -652,6 +688,246 @@ class Workspace:
             return ""
         shown = [f"{i:>5} | {lines[i - 1]}" for i in range(first, min(last, len(lines)) + 1)]
         result = "\n".join(shown)
+        self.last_full_result = result
+        return result[: self.config.max_output_chars]
+
+    @staticmethod
+    def _mime_type(path: str, fallback: str = "application/octet-stream") -> str:
+        return mimetypes.guess_type(path)[0] or fallback
+
+    def _image_attachment(self, raw: bytes, name: str, detail: str = "auto") -> dict[str, Any]:
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise AgentError("image support requires Pillow; install it with: python -m pip install pillow") from exc
+        try:
+            with Image.open(io.BytesIO(raw)) as image:
+                image.load()
+                width, height = image.size
+                image_format = (image.format or "PNG").upper()
+                if len(raw) > self.config.max_image_bytes or max(width, height) > self.config.max_image_dimension:
+                    converted = image.convert("RGB") if image.mode not in {"RGB", "L"} else image.copy()
+                    converted.thumbnail((self.config.max_image_dimension, self.config.max_image_dimension))
+                    output = io.BytesIO()
+                    converted.save(output, format="JPEG", quality=85, optimize=True)
+                    raw = output.getvalue()
+                    image_format = "JPEG"
+                mime = "image/jpeg" if image_format == "JPEG" else self._mime_type(name, "image/png")
+        except Exception as exc:
+            raise AgentError(f"unsupported or invalid image: {name}") from exc
+        if len(raw) > self.config.max_image_bytes:
+            raise AgentError(f"image is too large after compression: {name}")
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}",
+                "detail": detail,
+            },
+            "name": name,
+        }
+
+    def read_image(self, path: str, detail: str = "auto") -> str:
+        """Load one workspace image and make it available to a vision-capable model."""
+        file = self.resolve(path)
+        if not file.is_file():
+            raise AgentError(f"not a file: {path}")
+        if file.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
+            raise AgentError("read_image supports PNG, JPEG, WEBP, GIF, BMP, and TIFF files")
+        if detail not in {"low", "auto", "high"}:
+            raise AgentError("detail must be low, auto, or high")
+        try:
+            raw = file.read_bytes()
+        except OSError as exc:
+            raise AgentError(f"could not read image: {exc}") from exc
+        attachment = self._image_attachment(raw, file.name, detail)
+        self.last_images = [attachment]
+        result = f"image_loaded: {file.relative_to(self.root)} ({attachment['image_url']['url'].split(';', 1)[0]})"
+        self.last_full_result = result
+        return result
+
+    def _render_pdf_images(self, file: Path, start_page: int, end_page: int, detail: str = "auto") -> list[dict[str, Any]]:
+        pages = list(range(start_page, min(end_page, start_page + self.config.max_image_pages - 1) + 1))
+        attachments: list[dict[str, Any]] = []
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            fitz = None
+        if fitz is not None:
+            try:
+                document = fitz.open(str(file))
+                try:
+                    for page in pages:
+                        pixmap = document.load_page(page - 1).get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                        attachments.append(self._image_attachment(pixmap.tobytes("png"), f"{file.name} page {page}.png", detail))
+                finally:
+                    document.close()
+                return attachments
+            except Exception as exc:
+                raise AgentError(f"could not render PDF visually: {exc}") from exc
+        renderer = shutil.which("pdftoppm")
+        if not renderer:
+            raise AgentError("visual PDF reading requires PyMuPDF or the pdftoppm command")
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="coding-agent-pdf-") as directory:
+            output_dir = Path(directory)
+            for page in pages:
+                prefix = output_dir / f"page-{page}"
+                completed = subprocess.run(
+                    [renderer, "-f", str(page), "-l", str(page), "-png", "-singlefile", str(file), str(prefix)],
+                    capture_output=True, text=True, errors="replace", timeout=self.config.command_timeout,
+                )
+                rendered = prefix.with_suffix(".png")
+                if completed.returncode != 0 or not rendered.is_file():
+                    detail_text = (completed.stderr or completed.stdout or "renderer failed").strip()
+                    raise AgentError(f"could not render PDF page {page}: {detail_text}")
+                attachments.append(self._image_attachment(rendered.read_bytes(), f"{file.name} page {page}.png", detail))
+        return attachments
+
+    def read_pdf(self, path: str, start_page: int = 1, end_page: int | None = None, include_images: bool = False) -> str:
+        """Extract text from a PDF without passing binary document data to the model."""
+        file = self.resolve(path)
+        if file.suffix.lower() != ".pdf":
+            raise AgentError("read_pdf only supports .pdf files")
+        if not file.is_file():
+            raise AgentError(f"not a file: {path}")
+        if start_page < 1 or (end_page is not None and end_page < 1):
+            raise AgentError("page numbers are 1-based")
+        if end_page is not None and start_page > end_page:
+            raise AgentError("start_page must not be greater than end_page")
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:
+            raise AgentError("PDF support requires pypdf; install it with: python -m pip install pypdf") from exc
+        try:
+            with file.open("rb") as stream:
+                reader = PdfReader(stream)
+                if reader.is_encrypted:
+                    try:
+                        if not reader.decrypt(""):
+                            raise AgentError("encrypted PDF cannot be opened without a password")
+                    except AgentError:
+                        raise
+                    except Exception as exc:
+                        raise AgentError("encrypted PDF cannot be opened without a password") from exc
+                page_count = len(reader.pages)
+                last_page = end_page or page_count
+                if start_page > page_count or last_page > page_count:
+                    raise AgentError(f"page range {start_page}-{last_page} is outside PDF ({page_count} pages)")
+                sections: list[str] = []
+                for number in range(start_page, last_page + 1):
+                    text = reader.pages[number - 1].extract_text() or ""
+                    sections.append(f"[Page {number}]\n{text.strip()}".rstrip())
+        except AgentError:
+            raise
+        except Exception as exc:
+            # pypdf raises several parser-specific exception classes across versions.
+            raise AgentError(f"could not read PDF: {exc}") from exc
+        result = "\n\n".join(sections)
+        has_text = any(not section.rstrip().endswith(f"[Page {number}]") for number, section in zip(range(start_page, last_page + 1), sections))
+        self.last_images = []
+        if include_images or not has_text:
+            try:
+                self.last_images = self._render_pdf_images(file, start_page, last_page)
+            except AgentError as exc:
+                if not has_text:
+                    raise AgentError("PDF contains no extractable text and visual rendering is unavailable; install PyMuPDF or pdftoppm")
+                if include_images:
+                    raise exc
+        if not result and not self.last_images:
+            raise AgentError("PDF contains no extractable text; OCR is not available")
+        if self.last_images:
+            result = (result + "\n\n" if result else "") + f"[Visual pages attached: {len(self.last_images)}]"
+        self.last_full_result = result
+        return result[: self.config.max_output_chars]
+
+    @staticmethod
+    def _docx_local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1]
+
+    @classmethod
+    def _docx_paragraph_text(cls, element: ET.Element) -> str:
+        parts: list[str] = []
+        for node in element.iter():
+            kind = cls._docx_local_name(node.tag)
+            if kind == "t":
+                parts.append(node.text or "")
+            elif kind == "br":
+                parts.append("\n")
+        return "".join(parts)
+
+    def read_docx(self, path: str, start_paragraph: int = 1, end_paragraph: int | None = None, include_images: bool = False) -> str:
+        """Extract document-level paragraphs and tables from a DOCX OOXML package."""
+        file = self.resolve(path)
+        if file.suffix.lower() != ".docx":
+            raise AgentError("read_docx only supports .docx files; convert legacy .doc files to DOCX or PDF")
+        if not file.is_file():
+            raise AgentError(f"not a file: {path}")
+        if start_paragraph < 1 or (end_paragraph is not None and end_paragraph < 1):
+            raise AgentError("paragraph numbers are 1-based")
+        if end_paragraph is not None and start_paragraph > end_paragraph:
+            raise AgentError("start_paragraph must not be greater than end_paragraph")
+        try:
+            with zipfile.ZipFile(file) as package:
+                try:
+                    document_xml = package.read("word/document.xml")
+                except KeyError as exc:
+                    raise AgentError("DOCX is missing word/document.xml") from exc
+                media = [
+                    (name, package.read(name))
+                    for name in package.namelist()
+                    if include_images and name.startswith("word/media/") and not name.endswith("/")
+                ]
+            root = ET.fromstring(document_xml)
+        except AgentError:
+            raise
+        except (OSError, zipfile.BadZipFile, ET.ParseError) as exc:
+            raise AgentError(f"could not read DOCX: {exc}") from exc
+
+        body = next((element for element in root.iter() if self._docx_local_name(element.tag) == "body"), None)
+        if body is None:
+            raise AgentError("DOCX is missing a document body")
+        sections: list[str] = []
+        paragraph_number = 0
+        table_number = 0
+        for child in list(body):
+            kind = self._docx_local_name(child.tag)
+            if kind == "p":
+                paragraph_number += 1
+                if start_paragraph <= paragraph_number and (end_paragraph is None or paragraph_number <= end_paragraph):
+                    text = self._docx_paragraph_text(child)
+                    sections.append(f"[Paragraph {paragraph_number}]\n{text}".rstrip())
+            elif kind == "tbl":
+                table_number += 1
+                rows: list[str] = []
+                for row in child:
+                    if self._docx_local_name(row.tag) != "tr":
+                        continue
+                    cells: list[str] = []
+                    for cell in row:
+                        if self._docx_local_name(cell.tag) == "tc":
+                            paragraphs = [
+                                self._docx_paragraph_text(paragraph)
+                                for paragraph in cell.iter()
+                                if self._docx_local_name(paragraph.tag) == "p"
+                            ]
+                            cell_text = "\n".join(paragraph for paragraph in paragraphs if paragraph)
+                            cells.append(cell_text)
+                    if cells:
+                        rows.append(" | ".join(cells))
+                if rows:
+                    sections.append(f"[Table {table_number}]\n" + "\n".join(rows))
+        self.last_images = []
+        if include_images:
+            for name, raw in media[: self.config.max_image_pages]:
+                try:
+                    self.last_images.append(self._image_attachment(raw, Path(name).name))
+                except AgentError:
+                    continue
+        if not sections and not self.last_images:
+            raise AgentError("DOCX contains no extractable paragraphs, tables, or supported images")
+        result = "\n\n".join(sections)
+        if self.last_images:
+            result += ("\n\n" if result else "") + f"[Embedded images attached: {len(self.last_images)}]"
         self.last_full_result = result
         return result[: self.config.max_output_chars]
 
@@ -842,7 +1118,9 @@ class Workspace:
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
         self.last_full_result = None
-        methods = {"list_files": self.list_files, "read_file": self.read_file, "search_files": self.search_files,
+        self.last_images = []
+        methods = {"list_files": self.list_files, "read_file": self.read_file, "read_pdf": self.read_pdf,
+                   "read_image": self.read_image, "read_docx": self.read_docx, "search_files": self.search_files,
                    "write_file": self.write_file, "apply_patch": self.apply_patch, "run_command": self.run_command,
                    "verify_task": self.verify_task}
         if name not in methods:
@@ -852,6 +1130,7 @@ class Workspace:
 
 SYSTEM_PROMPT = """You are a careful coding agent working in a local workspace.
 Inspect before editing. Use tools for all file reads and changes; do not pretend a change happened.
+Use read_pdf for PDF text extraction and read_docx for Word DOCX paragraphs and tables. Set include_images=true when visual content matters; use read_image for standalone images. The local agent attaches images as multimodal input, so the configured model must support vision. Scanned PDFs can be rendered for visual inspection, while legacy .doc files must be converted first.
 Explain a concise plan, make the smallest useful edits, and run relevant tests when approved.
 After changing files, call verify_task with the narrowest relevant test, lint, or build command.
 Only after verification succeeds call finish_task with a concise summary of changes and validation.
@@ -1122,6 +1401,8 @@ class CodingAgent:
                 self._last_task_status = "answered"
                 self._run_end(emit, step, started_at, result, usage_before)
                 return result
+            pending_images: list[dict[str, Any]] = []
+            pending_image_names: list[str] = []
             for call in tool_calls:
                 function = call.get("function", {}) if isinstance(call, dict) else {}
                 name = function.get("name", "") if isinstance(function, dict) else ""
@@ -1217,10 +1498,27 @@ class CodingAgent:
                     "elapsed": time.perf_counter() - tool_started_at,
                 }))
                 self._append_message({"role": "tool", "tool_call_id": tool_id, "content": result})
+                if ok and name in {"read_image", "read_pdf", "read_docx"} and self.workspace.last_images:
+                    pending_images.extend(self.workspace.last_images)
+                    pending_image_names.extend(
+                        str(image.get("name", "workspace image"))
+                        for image in self.workspace.last_images
+                    )
                 if completion_summary is not None:
                     self._last_task_status = "verified" if changed_files else "completed"
                     self._run_end(emit, step, started_at, completion_summary, usage_before)
                     return completion_summary
+            if pending_images:
+                self._append_message({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Visual attachments from the previous tool call. Inspect them directly and use their visible content in the task. Files: " + ", ".join(pending_image_names),
+                        },
+                        *pending_images,
+                    ],
+                })
         result = "达到最大步骤数，任务尚未确认完成。请检查工作区后继续。"
         emit(("assistant_delta", result))
         self._run_end(emit, self.config.max_steps, started_at, result, usage_before)
