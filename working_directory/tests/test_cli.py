@@ -57,13 +57,15 @@ class CLITests(unittest.TestCase):
                 "cli.py", "--root", str(root), "--session-dir", str(sessions),
                 "--undo-dir", str(Path(directory) / "snapshots"), "first task",
             ]
+            output = io.StringIO()
             with patch.object(sys, "argv", argv), \
                     patch("cli.make_agent", side_effect=fake_make_agent), \
                     patch("builtins.input", side_effect=["second task", "/exit"]), \
-                    redirect_stdout(io.StringIO()):
+                    redirect_stdout(output):
                 self.assertEqual(cli.main(), 0)
 
             self.assertEqual(tasks, ["first task", "second task"])
+            self.assertIn("Hello, NJU Software Institute!", output.getvalue())
             saved = SessionStore(sessions).list_sessions(root)
             self.assertEqual(len(saved), 1)
             self.assertEqual(

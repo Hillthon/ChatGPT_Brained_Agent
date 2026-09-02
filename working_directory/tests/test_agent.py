@@ -2,6 +2,7 @@ import io
 import json
 import urllib.error
 import unittest
+import zipfile
 from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -59,6 +60,8 @@ class AgentTests(unittest.TestCase):
         schemas = {item["function"]["name"]: item["function"]["parameters"] for item in TOOL_SCHEMAS}
         self.assertEqual(schemas["write_file"]["required"], ["path", "content"])
         self.assertEqual(schemas["list_files"]["required"], [])
+        self.assertEqual(schemas["read_pdf"]["required"], ["path"])
+        self.assertEqual(schemas["read_docx"]["required"], ["path"])
 
     def test_write_requires_approval(self):
         with TemporaryDirectory() as directory:
@@ -71,6 +74,132 @@ class AgentTests(unittest.TestCase):
             workspace = Workspace(directory, approve=lambda _: True)
             self.assertIn("wrote", workspace.write_file("a.txt", "one\ntwo\n"))
             self.assertIn("2 | two", workspace.read_file("a.txt"))
+
+    def test_read_pdf_extracts_pages_and_respects_range(self):
+        class FakePage:
+            def __init__(self, text):
+                self.text = text
+
+            def extract_text(self):
+                return self.text
+
+        class FakeReader:
+            is_encrypted = False
+            pages = [FakePage("first page"), FakePage("second page")]
+
+        with TemporaryDirectory() as directory:
+            pdf = Path(directory) / "notes.pdf"
+            pdf.write_bytes(b"not parsed by the patched reader")
+            workspace = Workspace(directory)
+            with patch("pypdf.PdfReader", return_value=FakeReader()):
+                result = workspace.read_pdf("notes.pdf", start_page=2, end_page=2)
+            self.assertEqual(result, "[Page 2]\nsecond page")
+            self.assertEqual(workspace.last_full_result, result)
+
+    def test_read_pdf_rejects_invalid_range_and_non_pdf(self):
+        with TemporaryDirectory() as directory:
+            Path(directory, "notes.pdf").write_bytes(b"")
+            Path(directory, "notes.txt").write_text("text", encoding="utf-8")
+            workspace = Workspace(directory)
+            with self.assertRaises(AgentError):
+                workspace.read_pdf("notes.pdf", start_page=2, end_page=1)
+            with self.assertRaises(AgentError):
+                workspace.read_pdf("notes.txt")
+            with self.assertRaises(AgentError):
+                workspace.read_pdf("../notes.pdf")
+
+    def test_read_image_creates_a_multimodal_attachment(self):
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "diagram.png"
+            Image.new("RGB", (12, 8), "red").save(path)
+            workspace = Workspace(directory)
+            result = workspace.read_image("diagram.png")
+            self.assertTrue(result.startswith("image_loaded: diagram.png"))
+            self.assertEqual(len(workspace.last_images), 1)
+            image_url = workspace.last_images[0]["image_url"]["url"]
+            self.assertTrue(image_url.startswith("data:image/png;base64,"))
+
+    def test_agent_forwards_read_image_to_the_next_model_turn(self):
+        replies = [
+            {"content": "", "tool_calls": [{"id": "img", "function": {"name": "read_image", "arguments": json.dumps({"path": "diagram.png"})}}]},
+            {"content": "I inspected the image.", "tool_calls": []},
+        ]
+        from PIL import Image
+
+        with TemporaryDirectory() as directory:
+            Image.new("RGB", (4, 4), "blue").save(Path(directory) / "diagram.png")
+            client = FakeClient(replies)
+            agent = CodingAgent(client, Workspace(directory))
+            self.assertEqual(agent.run("inspect diagram"), "I inspected the image.")
+            self.assertEqual(len(client.calls), 2)
+            visual_messages = [message for message in client.calls[1] if isinstance(message.get("content"), list)]
+            self.assertEqual(len(visual_messages), 1)
+            self.assertEqual(visual_messages[0]["content"][1]["type"], "image_url")
+
+    def test_responses_input_converts_image_url_to_input_image(self):
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "inspect"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc", "detail": "high"}},
+            ],
+        }]
+        converted = OpenAICompatibleClient._responses_input(messages)
+        self.assertEqual(converted[0]["content"][0], {"type": "input_text", "text": "inspect"})
+        self.assertEqual(converted[0]["content"][1], {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "high"})
+
+    def test_read_docx_extracts_paragraphs_and_tables(self):
+        document = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Project requirements</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr><w:tc><w:p><w:r><w:t>ID</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc></w:tr>
+      <w:tr><w:tc><w:p><w:r><w:t>1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Ada</w:t></w:r></w:p></w:tc></w:tr>
+    </w:tbl>
+    <w:p><w:r><w:t>Build and test</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "requirements.docx"
+            with zipfile.ZipFile(path, "w") as package:
+                package.writestr("word/document.xml", document)
+            workspace = Workspace(directory)
+            result = workspace.read_docx("requirements.docx")
+            self.assertIn("[Paragraph 1]\nProject requirements", result)
+            self.assertIn("[Table 1]\nID | Name\n1 | Ada", result)
+            self.assertIn("[Paragraph 2]\nBuild and test", result)
+
+    def test_read_docx_rejects_legacy_doc_and_truncates(self):
+        with TemporaryDirectory() as directory:
+            Path(directory, "legacy.doc").write_bytes(b"binary")
+            document = """<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>long paragraph</w:t></w:r></w:p></w:body></w:document>"""
+            path = Path(directory) / "short.docx"
+            with zipfile.ZipFile(path, "w") as package:
+                package.writestr("word/document.xml", document)
+            workspace = Workspace(directory, config=AgentConfig(max_output_chars=5))
+            with self.assertRaises(AgentError):
+                workspace.read_docx("legacy.doc")
+            self.assertEqual(workspace.read_docx("short.docx"), "[Para")
+            self.assertTrue(workspace.last_full_result.startswith("[Paragraph 1]"))
+
+    def test_read_docx_can_read_an_image_only_document(self):
+        from PIL import Image
+
+        image = io.BytesIO()
+        Image.new("RGB", (3, 3), "green").save(image, format="PNG")
+        document = "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body/></w:document>"
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "image-only.docx"
+            with zipfile.ZipFile(path, "w") as package:
+                package.writestr("word/document.xml", document)
+                package.writestr("word/media/image1.png", image.getvalue())
+            workspace = Workspace(directory)
+            result = workspace.read_docx("image-only.docx", include_images=True)
+            self.assertIn("[Embedded images attached: 1]", result)
+            self.assertEqual(len(workspace.last_images), 1)
 
     def test_command_guardrails(self):
         with TemporaryDirectory() as directory:

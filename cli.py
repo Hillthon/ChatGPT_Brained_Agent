@@ -26,6 +26,7 @@ COMMAND_HELP = """Session commands:
   /exit                 save and exit"""
 DEFAULT_SESSION_DIR = Path.home() / ".coding-agent" / "sessions"
 DEFAULT_UNDO_DIR = Path.home() / ".coding-agent" / "snapshots"
+WELCOME_TEXT = "Hello, NJU Software Institute!"
 
 
 def format_sessions(sessions: list[AgentSession], current_id: str | None = None) -> str:
@@ -128,10 +129,23 @@ class Renderer:
 
     def _action(self, name: str, arguments: Any) -> str:
         args = arguments if isinstance(arguments, dict) else {}
+        if name == "read_image":
+            detail = args.get("detail", "auto")
+            return f"read_image  {self._short_path(args.get('path'))} ({detail})"
         if name == "read_file":
             start = args.get("start_line", 1)
             end = args.get("end_line") or "end"
             return f"read_file  {self._short_path(args.get('path'))}:{start}-{end}"
+        if name == "read_pdf":
+            start = args.get("start_page", 1)
+            end = args.get("end_page") or "end"
+            visual = ", visual" if args.get("include_images") else ""
+            return f"read_pdf  {self._short_path(args.get('path'))}:{start}-{end}{visual}"
+        if name == "read_docx":
+            start = args.get("start_paragraph", 1)
+            end = args.get("end_paragraph") or "end"
+            visual = ", visual" if args.get("include_images") else ""
+            return f"read_docx  {self._short_path(args.get('path'))}:{start}-{end}{visual}"
         if name == "search_files":
             query = json.dumps(str(args.get("query", "")), ensure_ascii=False)
             return f"search_files  {query} in {self._short_path(args.get('path', '.'))}"
@@ -220,7 +234,7 @@ class Renderer:
             if lines:
                 for line in lines:
                     self._line(f"   {line}")
-        elif self.verbosity and display_result and name in {"read_file", "search_files", "list_files"}:
+        elif self.verbosity and display_result and name in {"read_file", "read_image", "read_pdf", "read_docx", "search_files", "list_files"}:
             for line in display_result.splitlines():
                 self._line(f"   {line}")
 
@@ -335,7 +349,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="A small local coding agent")
     parser.add_argument("task", nargs="?", help="initial programming task; more tasks can follow interactively")
     parser.add_argument("--root", default="./working_directory", help="workspace root")
-    parser.add_argument("--model", default=os.environ.get("CODING_AGENT_MODEL", "gpt-5.6-luna"))
+    parser.add_argument("--model", default=os.environ.get("CODING_AGENT_MODEL", "gpt-5.6-sol"))
     parser.add_argument(
         "--base-url",
         default=(os.environ.get("CODING_AGENT_BASE_URL") or os.environ.get("RIGHTAPI_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://rightapi.ai/codex/v1"),
@@ -351,7 +365,7 @@ def main() -> int:
         default=os.environ.get("CODING_AGENT_API_MODE", "auto"),
         help="relay protocol (default: auto)",
     )
-    parser.add_argument("--max-steps", type=int, default=100)
+    parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--request-timeout", type=int, default=120, help="model request timeout in seconds")
     parser.add_argument("--audit-log", help="write local JSONL audit records to this workspace-relative path")
     parser.add_argument(
@@ -375,6 +389,9 @@ def main() -> int:
     args = parser.parse_args()
 
     renderer = Renderer(args.verbose or 0, args.quiet, color=False if args.no_color else None)
+    renderer._line(renderer._paint(WELCOME_TEXT, "cyan"))
+    if not args.quiet:
+        renderer._line(renderer._paint("A Coding Agent Made by QuanYuan| Safe Workspace Tools | Persistent Sessions", "yellow"))
     store = SessionStore(args.session_dir)
     if args.list_sessions:
         print(format_sessions(store.list_sessions()))
