@@ -12,15 +12,20 @@ from typing import Any, Callable, TextIO
 
 from agent import AgentConfig, AgentError, CodingAgent, AgentEvent, make_agent
 from session import AgentSession, SessionStore
+from undo import UndoManager
 
 
 COMMAND_HELP = """Session commands:
   /new                 start a new session
   /sessions            list saved sessions
   /switch <session-id> resume another session
+  /undo                undo the latest agent file edit
+  /rollback            undo all file edits from the latest changed task
+  /checkpoints         list reversible file edits
   /help                show these commands
   /exit                 save and exit"""
 DEFAULT_SESSION_DIR = Path.home() / ".coding-agent" / "sessions"
+DEFAULT_UNDO_DIR = Path.home() / ".coding-agent" / "snapshots"
 
 
 def format_sessions(sessions: list[AgentSession], current_id: str | None = None) -> str:
@@ -142,8 +147,8 @@ class Renderer:
         return f"{name}  {json.dumps(args, ensure_ascii=False, separators=(',', ':'))}"
 
     def approval_prompt(self, action: str) -> str:
-        if action.startswith("run command:"):
-            return f"? Run: {action.split(':', 1)[1].strip()} [y/N] "
+        if action.startswith("run command"):
+            return f"? Run (rollback not guaranteed): {action.split(':', 1)[1].strip()} [y/N] "
         if action.startswith("patch "):
             return f"? Apply patch: {action[6:]} [y/N] "
         if action.startswith("write "):
@@ -291,11 +296,13 @@ def _make_session_agent(
     approve: Callable[[str], bool],
     audit_path: str | Path | None,
     api_key: str | None,
+    undo_directory: str | Path,
 ) -> CodingAgent:
     def checkpoint(messages: list[dict[str, Any]]) -> None:
         session.messages = messages
         store.save(session)
 
+    undo_manager = UndoManager(undo_directory, session.id, root)
     agent = make_agent(
         root,
         config=config,
@@ -304,6 +311,7 @@ def _make_session_agent(
         api_key=api_key,
         messages=session.messages,
         on_history_change=checkpoint,
+        undo_manager=undo_manager,
     )
     checkpoint(agent.messages)
     return agent
@@ -336,6 +344,11 @@ def main() -> int:
         "--session-dir",
         default=os.environ.get("CODING_AGENT_SESSION_DIR", str(DEFAULT_SESSION_DIR)),
         help="directory for local session JSON files",
+    )
+    parser.add_argument(
+        "--undo-dir",
+        default=os.environ.get("CODING_AGENT_UNDO_DIR", str(DEFAULT_UNDO_DIR)),
+        help="directory for rollback indexes and file snapshots",
     )
     parser.add_argument("-v", "--verbose", action="count", default=0, help="show tool results; repeat for raw tool calls")
     parser.add_argument("-q", "--quiet", action="store_true", help="hide tool summaries and show the answer stream")
@@ -378,7 +391,9 @@ def main() -> int:
         else:
             session = store.create(root)
             session_status = "new"
-        agent = _make_session_agent(session, store, root, config, approve, args.audit_log, args.api_key)
+        agent = _make_session_agent(
+            session, store, root, config, approve, args.audit_log, args.api_key, args.undo_dir
+        )
     except Exception as exc:
         renderer.error(exc)
         return 1
@@ -410,7 +425,9 @@ def main() -> int:
         elif task == "/new":
             try:
                 session = store.create(root)
-                agent = _make_session_agent(session, store, root, config, approve, args.audit_log, args.api_key)
+                agent = _make_session_agent(
+                    session, store, root, config, approve, args.audit_log, args.api_key, args.undo_dir
+                )
                 if not args.quiet:
                     print(f"Session {session.id} (new)")
             except Exception as exc:
@@ -423,12 +440,46 @@ def main() -> int:
                 try:
                     candidate = store.load(session_id)
                     _require_same_workspace(candidate, root)
-                    agent = _make_session_agent(candidate, store, root, config, approve, args.audit_log, args.api_key)
+                    agent = _make_session_agent(
+                        candidate, store, root, config, approve, args.audit_log, args.api_key, args.undo_dir
+                    )
                     session = candidate
                     if not args.quiet:
                         print(f"Session {session.id} (resumed)")
                 except Exception as exc:
                     renderer.error(exc)
+        elif task == "/undo":
+            try:
+                action = agent.workspace.undo_last()
+                agent.record_control_event(
+                    f"Undid the latest {action.tool} edit to {action.path}. Reread the file before editing it again."
+                )
+                print(f"Undid {action.tool}: {action.path} [{action.id[:8]}]")
+            except Exception as exc:
+                renderer.error(exc)
+        elif task == "/rollback":
+            try:
+                changed_task, actions = agent.workspace.rollback_latest_task()
+                paths = list(dict.fromkeys(action.path for action in actions))
+                agent.record_control_event(
+                    "Rolled back the latest changed task and restored: " + ", ".join(paths)
+                )
+                print(
+                    f"Rolled back {len(actions)} edit(s) from task {changed_task.id[:8]}: "
+                    + ", ".join(paths)
+                )
+            except Exception as exc:
+                renderer.error(exc)
+        elif task == "/checkpoints":
+            actions = agent.workspace.undo_checkpoints()
+            if not actions:
+                print("(no reversible agent edits)")
+            else:
+                for action in reversed(actions):
+                    print(
+                        f"{action.id[:8]}  task {action.task_id[:8]}  "
+                        f"{action.tool}  {action.path}"
+                    )
         elif task.startswith("/"):
             print("Unknown command. Type /help for session commands.")
         else:

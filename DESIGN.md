@@ -10,6 +10,7 @@
 4. **可靠性**：工具异常作为 `ERROR` 观察结果回传模型；最大步骤数防止死循环；上下文按完整对话组裁剪；可选 JSONL 审计日志记录副作用。
 5. **连续对话与会话**：CLI 在单个任务完成后继续接收输入；`SessionStore` 将多个独立消息历史持久化，并支持列出、新建、恢复和切换。
 6. **终端交互**：agent 只产生结构化事件，Renderer 决定默认、详细和安静模式的可见内容；模型文本可通过 SSE 增量输出。
+7. **持久化文件回滚**：`write_file` 和 `apply_patch` 在写入前保存文件快照，按 session 和任务记录检查点；CLI 支持单步撤销、整任务回滚和检查点查看。
 
 ## 两层循环与事件
 
@@ -38,6 +39,13 @@ session -> 用户任务 -> 模型 <-> 本地工具循环 -> 最终回答
 - `write_file` 和 `apply_patch` 在批准回调之前通过 `Workspace.preview()` 生成 unified diff，Renderer 先展示 diff，再由 CLI 提示确认；这使审核看到的内容与实际执行保持一致。
 - `-v` 打开只读工具结果和完整命令输出，`-vv` 加上原始工具调用及模型请求/响应/chunk；`-q` 隐藏动作行但仍保留等待状态和最终回答。错误默认一行显示，详细 traceback 只在 `-vv` 出现。
 - Chat Completions SSE 会重组文本和分片 tool-call arguments；Responses 支持 `response.output_text.delta`、`response.function_call_arguments.delta` 等事件。若网关忽略 `stream` 返回普通 JSON，解析器仍接受该响应。
+
+## 文件回滚边界
+
+- `UndoManager` 仅跟踪由 `write_file` 和 `apply_patch` 成功产生的文件变化。每次编辑保存编辑前字节、权限位以及编辑前后 SHA-256；新建文件记录为“撤销时删除”，没有变化或被拒绝、失败的编辑不产生检查点。
+- 快照默认存放在 workspace 外的 `~/.coding-agent/snapshots/<session-id>`，索引和二进制快照使用同目录临时文件原子写入。索引绑定 session ID 和规范化 workspace；进程重启后仍可恢复，但另一个 session 不能使用这些检查点。
+- `/undo` 恢复当前 session 最近一次仍有效的文件编辑；`/rollback` 按逆序恢复最近一个有文件变化的任务。恢复前会比较当前文件与记录的编辑后哈希；如果用户、其他程序或后续未记录操作改过文件，则抛出冲突而不是强制覆盖。
+- 这是文件级、Agent 行为级回滚，不是虚拟机或完整文件系统事务。`run_command` 可能修改任意文件、Git 状态、依赖、数据库或外部服务，这些副作用不被承诺可撤销，执行确认中会明确提示这一点。
 
 ## 可辩护的取舍
 
