@@ -533,6 +533,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     _json_schema("write_file", "Create or replace a UTF-8 file. Use only when the user requested a change.", path={"type": "string"}, content={"type": "string"}),
     _json_schema("apply_patch", "Apply a unified diff to one workspace-relative file.", path={"type": "string"}, patch={"type": "string"}),
     _json_schema("run_command", "Run a project command in the workspace after confirmation.", command={"type": "string"}, timeout={"type": "integer", "minimum": 1, "maximum": 120, "default": 30}),
+    _json_schema("verify_task", "Run the project's tests, checks, or build command. A zero exit code is required before finishing a task that changed files.", command={"type": "string"}, timeout={"type": "integer", "minimum": 1, "maximum": 120, "default": 30}),
+    _json_schema("finish_task", "Submit a task completion summary after verification. Do not use this before verify_task succeeds when files were changed.", summary={"type": "string"}),
 ]
 
 
@@ -822,10 +824,18 @@ class Workspace:
         self._audit("run_command", command=command, exit_code=result.returncode)
         return f"exit_code={result.returncode}\n{bounded_output}" if bounded_output else f"exit_code={result.returncode}"
 
+    def verify_task(self, command: str, timeout: int | None = None) -> str:
+        """Run an explicit validation command and label its result for the agent loop."""
+        result = self.run_command(command, timeout)
+        if result.startswith("exit_code=0"):
+            return f"verification_passed\n{result}"
+        return f"verification_failed\n{result}"
+
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
         self.last_full_result = None
         methods = {"list_files": self.list_files, "read_file": self.read_file, "search_files": self.search_files,
-                   "write_file": self.write_file, "apply_patch": self.apply_patch, "run_command": self.run_command}
+                   "write_file": self.write_file, "apply_patch": self.apply_patch, "run_command": self.run_command,
+                   "verify_task": self.verify_task}
         if name not in methods:
             raise AgentError(f"unknown tool: {name}")
         return methods[name](**arguments)
@@ -834,6 +844,9 @@ class Workspace:
 SYSTEM_PROMPT = """You are a careful coding agent working in a local workspace.
 Inspect before editing. Use tools for all file reads and changes; do not pretend a change happened.
 Explain a concise plan, make the smallest useful edits, and run relevant tests when approved.
+After changing files, call verify_task with the narrowest relevant test, lint, or build command.
+Only after verification succeeds call finish_task with a concise summary of changes and validation.
+Do not claim completion in ordinary text after a file change; the local agent requires finish_task.
 Never request secrets, access paths outside the workspace, or destructive commands.
 When the task is complete, summarize changed files and verification. If blocked, say exactly why."""
 
@@ -890,6 +903,8 @@ class CodingAgent:
     def _tool_ok(name: str, result: str) -> bool:
         if result.startswith(("ERROR:", "DENIED", "TIMEOUT")):
             return False
+        if name == "verify_task":
+            return result.startswith("verification_passed\n")
         if name == "run_command":
             match = re.match(r"exit_code=(-?\d+)", result)
             if match and int(match.group(1)) != 0:
@@ -908,6 +923,8 @@ class CodingAgent:
             "steps": steps,
             "elapsed": time.perf_counter() - started_at,
             "result": result,
+            "completion_status": getattr(self, "_last_task_status", "incomplete"),
+            "completion_confirmed": getattr(self, "_last_task_status", "incomplete") in {"verified", "answered", "completed"},
             "usage": usage_delta,
         }))
 
@@ -918,13 +935,17 @@ class CodingAgent:
         except BaseException:
             self.workspace.finish_undo_task(undo_task_id, "interrupted")
             raise
-        self.workspace.finish_undo_task(undo_task_id, "completed")
+        self.workspace.finish_undo_task(undo_task_id, self._last_task_status)
         return result
 
     def _run_task(self, task: str, on_event: EventHandler | None = None) -> str:
         emit = on_event or (lambda _: None)
         started_at = time.perf_counter()
         usage_before = dict(getattr(self.client, "total_usage", {}) or {})
+        changed_files = False
+        verification_passed = False
+        completion_summary: str | None = None
+        self._last_task_status = "incomplete"
         self._append_message({"role": "user", "content": task})
         for step in range(1, self.config.max_steps + 1):
             self._trim_context()
@@ -955,9 +976,15 @@ class CodingAgent:
                 emit(("assistant_delta", content))
             self._append_message({"role": "assistant", "content": content, **({"tool_calls": tool_calls} if tool_calls else {})})
             if not tool_calls:
+                if changed_files:
+                    result = "尚未确认完成：本轮修改过文件，请先调用 verify_task 执行测试/检查，再调用 finish_task 提交完成。"
+                    emit(("verification_required", {"reason": "file_changes_without_finish", "step": step}))
+                    self._append_message({"role": "system", "content": result})
+                    continue
                 result = content.strip() or "完成。"
                 if not content:
                     emit(("assistant_delta", result))
+                self._last_task_status = "answered"
                 self._run_end(emit, step, started_at, result, usage_before)
                 return result
             for call in tool_calls:
@@ -1002,7 +1029,10 @@ class CodingAgent:
                 }))
                 tool_started_at = time.perf_counter()
                 try:
-                    result = self.workspace.execute(name, arguments)
+                    if name == "finish_task":
+                        result = "finish_task is evaluated by the local completion gate"
+                    else:
+                        result = self.workspace.execute(name, arguments)
                     ok = self._tool_ok(name, result)
                     if ok:
                         error = None
@@ -1015,6 +1045,32 @@ class CodingAgent:
                     ok = False
                     error = str(exc)
                     self.workspace._audit("tool_error", tool=name, error=error)
+                if ok and name in {"write_file", "apply_patch"}:
+                    changed_files = True
+                    verification_passed = False
+                if ok and name == "verify_task":
+                    verification_passed = True
+                if name == "finish_task":
+                    summary = arguments.get("summary", "")
+                    if not isinstance(summary, str) or not summary.strip():
+                        result = "ERROR: finish_task requires a non-empty summary"
+                        ok = False
+                        error = "finish_task requires a non-empty summary"
+                    elif changed_files and not verification_passed:
+                        result = "ERROR: cannot finish a task with file changes before verify_task succeeds"
+                        ok = False
+                        error = "verification is required after file changes"
+                    else:
+                        completion_summary = summary.strip()
+                        result = f"TASK_COMPLETED: {completion_summary}"
+                        ok = True
+                        error = None
+                    if not ok:
+                        emit(("completion_rejected", {
+                            "reason": error,
+                            "verification_passed": verification_passed,
+                            "changed_files": changed_files,
+                        }))
                 emit(("tool_end", {
                     "name": name,
                     "arguments": arguments,
@@ -1026,6 +1082,10 @@ class CodingAgent:
                     "elapsed": time.perf_counter() - tool_started_at,
                 }))
                 self._append_message({"role": "tool", "tool_call_id": tool_id, "content": result})
+                if completion_summary is not None:
+                    self._last_task_status = "verified" if changed_files else "completed"
+                    self._run_end(emit, step, started_at, completion_summary, usage_before)
+                    return completion_summary
         result = "达到最大步骤数，任务尚未确认完成。请检查工作区后继续。"
         emit(("assistant_delta", result))
         self._run_end(emit, self.config.max_steps, started_at, result, usage_before)

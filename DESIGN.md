@@ -11,6 +11,7 @@
 5. **连续对话与会话**：CLI 在单个任务完成后继续接收输入；`SessionStore` 将多个独立消息历史持久化，并支持列出、新建、恢复和切换。
 6. **终端交互**：agent 只产生结构化事件，Renderer 决定默认、详细和安静模式的可见内容；模型文本可通过 SSE 增量输出。
 7. **持久化文件回滚**：`write_file` 和 `apply_patch` 在写入前保存文件快照，按 session 和任务记录检查点；CLI 支持单步撤销、整任务回滚和检查点查看。
+8. **完成与验证闭环**：文件修改后必须经过 `verify_task` 的零退出码验证，再由 `finish_task` 显式提交摘要；本地循环拒绝未经验证的完成声明，并把拒绝原因反馈给模型继续执行。
 
 ## 两层循环与事件
 
@@ -21,7 +22,7 @@ session -> 用户任务 -> 模型 <-> 本地工具循环 -> 最终回答
    +---- checkpoint JSON <- 继续提问 / 切换 session
 ```
 
-`CodingAgent.run()` 发出 `("thinking", {...})`、`("tool_call", {...})`、`("tool_start", {...})`、`("tool_end", {...})`、`("assistant_delta", text)` 和 `("run_end", {...})`。模型客户端的 `model_request`、`model_response`、`model_chunk` 事件只在 `-vv` 显示。这样工具执行逻辑不依赖终端格式，CLI 也不会把裸参数、session JSON 或 API payload 混入默认输出。
+`CodingAgent.run()` 发出 `("thinking", {...})`、`("tool_call", {...})`、`("tool_start", {...})`、`("tool_end", {...})`、`("assistant_delta", text)`、`("verification_required", {...})`、`("completion_rejected", {...})` 和 `("run_end", {...})`。模型客户端的 `model_request`、`model_response`、`model_chunk` 事件只在 `-vv` 显示。这样工具执行逻辑不依赖终端格式，CLI 也不会把裸参数、session JSON 或 API payload 混入默认输出。
 
 模型没有本地文件系统或代码执行权限。它只能请求 `TOOL_SCHEMAS` 中列出的操作，实际副作用由 `Workspace` 完成，因此不依赖服务端 Code Interpreter 或 Files API。
 
@@ -46,6 +47,14 @@ session -> 用户任务 -> 模型 <-> 本地工具循环 -> 最终回答
 - 快照默认存放在 workspace 外的 `~/.coding-agent/snapshots/<session-id>`，索引和二进制快照使用同目录临时文件原子写入。索引绑定 session ID 和规范化 workspace；进程重启后仍可恢复，但另一个 session 不能使用这些检查点。
 - `/undo` 恢复当前 session 最近一次仍有效的文件编辑；`/rollback` 按逆序恢复最近一个有文件变化的任务。恢复前会比较当前文件与记录的编辑后哈希；如果用户、其他程序或后续未记录操作改过文件，则抛出冲突而不是强制覆盖。
 - 这是文件级、Agent 行为级回滚，不是虚拟机或完整文件系统事务。`run_command` 可能修改任意文件、Git 状态、依赖、数据库或外部服务，这些副作用不被承诺可撤销，执行确认中会明确提示这一点。
+
+## 完成判定与验证闭环
+
+- 过去模型返回任意普通文本就会结束任务，无法区分“已完成”“验证失败”和“暂时无法继续”。现在本地循环维护三个简单状态：本轮是否改过文件、`verify_task` 是否成功、是否收到 `finish_task`。
+- `verify_task` 是显式验证工具，复用现有命令执行和审批机制，并将退出码为 0 的结果标记为 `verification_passed`；非零退出、超时或拒绝都会标记为失败并回传模型。
+- 只要本轮改过文件，普通文本不会结束任务，`finish_task` 在验证通过前也会返回错误。模型收到错误后可以修复、重新验证，再提交完成摘要。
+- 没有文件修改的解释型任务仍允许普通文本结束，这是对问答场景的必要简化；真正的代码修改任务必须经过“修改 -> 验证 -> 完成提交”三步。
+- 最大步数仍是最终保险丝。达到上限时返回“任务尚未确认完成”，而不是伪装成成功。
 
 ## 可辩护的取舍
 
