@@ -11,6 +11,8 @@ Git 仓库地址：待创建公开仓库后填写。
 
 任务完成采用显式验证闭环：Agent 修改文件后必须调用 `verify_task` 执行测试、lint 或构建命令，并且命令退出码为 0；随后调用 `finish_task` 提交完成摘要，CLI 才会把任务标记为已验证完成。若模型只输出“完成”或在验证前调用 `finish_task`，本地完成门禁会拒绝结束并要求继续处理。没有文件修改的普通问答可以直接返回。
 
+上下文管理：`--context-tokens` 设置近似总上下文预算，`--output-tokens` 为模型回复预留空间，`--tool-result-chars` 限制活动上下文中的单个工具结果，`--task-summary-chars` 限制确定性任务摘要长度。模型请求会压缩并去重工具输出，再按完整任务轮次裁剪；被裁剪的旧任务会提取任务、文件、验证和错误事实形成摘要；完整 session 历史仍原样保存，不会因为一次裁剪而永久丢失。
+
 默认终端只显示 Thinking 状态、工具动作摘要、编辑 diff、命令输出末尾 20 行和流式最终回答；read/search/list 正文隐藏。-v 显示只读结果和完整命令输出，-vv 另外显示原始 tool call/API payload，-q 隐藏工具摘要但保留状态与答案，--no-color 关闭 ANSI 颜色。副作用确认提示为“? Run/Write/Apply patch ...”，工具错误只显示一行红字；完整审计仍写入 --audit-log 指定的 JSONL。
 
 特色：从零实现，不使用 LangChain、AutoGen 等 agent 框架。模型只提出工具调用，本地程序自行完成 SSE/非流式响应解析、工具执行、循环终止、上下文裁剪和 session 持久化；工具包括 list_files、read_file、search_files、write_file、apply_patch、run_command、verify_task、finish_task，并带工作区路径限制和破坏性命令拦截。

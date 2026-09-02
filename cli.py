@@ -352,6 +352,26 @@ def main() -> int:
         help="relay protocol (default: auto)",
     )
     parser.add_argument("--max-steps", type=int, default=100)
+    parser.add_argument(
+        "--context-tokens", type=int,
+        default=int(os.environ.get("CODING_AGENT_CONTEXT_TOKENS", "32000")),
+        help="approximate total model context budget, including reserved output tokens",
+    )
+    parser.add_argument(
+        "--output-tokens", type=int,
+        default=int(os.environ.get("CODING_AGENT_OUTPUT_TOKENS", "4000")),
+        help="tokens reserved for the model response",
+    )
+    parser.add_argument(
+        "--tool-result-chars", type=int,
+        default=int(os.environ.get("CODING_AGENT_TOOL_RESULT_CHARS", "6000")),
+        help="maximum tool-result characters retained in active model context",
+    )
+    parser.add_argument(
+        "--task-summary-chars", type=int,
+        default=int(os.environ.get("CODING_AGENT_TASK_SUMMARY_CHARS", "2000")),
+        help="maximum deterministic summary characters retained in active model context",
+    )
     parser.add_argument("--request-timeout", type=int, default=120, help="model request timeout in seconds")
     parser.add_argument("--audit-log", help="write local JSONL audit records to this workspace-relative path")
     parser.add_argument(
@@ -391,6 +411,10 @@ def main() -> int:
         model=args.model,
         base_url=args.base_url,
         max_steps=args.max_steps,
+        max_context_tokens=args.context_tokens,
+        max_output_tokens=args.output_tokens,
+        tool_result_max_chars=args.tool_result_chars,
+        task_summary_max_chars=args.task_summary_chars,
         api_mode=args.api_mode,
         request_timeout=args.request_timeout,
     )
