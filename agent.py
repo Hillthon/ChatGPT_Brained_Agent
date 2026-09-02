@@ -571,7 +571,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     _json_schema("read_docx", "Extract paragraphs and tables from a workspace DOCX and optionally attach embedded images.", path={"type": "string"}, start_paragraph={"type": "integer", "minimum": 1, "default": 1}, end_paragraph={"type": ["integer", "null"], "minimum": 1, "default": None}, include_images={"type": "boolean", "default": False}),
     _json_schema("search_files", "Search text in UTF-8 files below a directory.", query={"type": "string"}, path={"type": "string", "default": "."}),
     _json_schema("write_file", "Create or replace a UTF-8 file. Use only when the user requested a change.", path={"type": "string"}, content={"type": "string"}),
-    _json_schema("apply_patch", "Apply a unified diff to one workspace-relative file.", path={"type": "string"}, patch={"type": "string"}),
+    _json_schema("apply_patch", "Apply a single-file unified diff to one workspace-relative file. Prefer complete ---/+++ and @@ -start,count +start,count @@ headers; Codex-style *** Begin Patch wrappers are also accepted.", path={"type": "string"}, patch={"type": "string"}),
     _json_schema("run_command", "Run a project command in the workspace after confirmation.", command={"type": "string"}, timeout={"type": "integer", "minimum": 1, "maximum": 120, "default": 30}),
     _json_schema("verify_task", "Run the project's tests, checks, or build command. A zero exit code is required before finishing a task that changed files.", command={"type": "string"}, timeout={"type": "integer", "minimum": 1, "maximum": 120, "default": 30}),
     _json_schema("finish_task", "Submit a task completion summary after verification. Do not use this before verify_task succeeds when files were changed.", summary={"type": "string"}),
@@ -1030,16 +1030,60 @@ class Workspace:
 
     @staticmethod
     def _apply_unified_diff(old: list[str], patch: str) -> list[str]:
-        """Apply a single-file unified diff while checking every context line."""
+        """Apply a single-file diff while checking every context line.
+
+        Models sometimes emit the Codex ``*** Begin Patch`` wrapper or an
+        abbreviated ``@@`` header. Those forms are normalized below, but the
+        actual context/removal lines are still matched against the current file.
+        """
         if patch.lstrip().startswith("```"):
             fenced = patch.lstrip().splitlines(keepends=True)
             if len(fenced) < 3 or not fenced[-1].strip().startswith("```"):
                 raise AgentError("invalid patch: unclosed code fence")
             patch = "".join(fenced[1:-1])
         lines = patch.splitlines(keepends=True)
+        if any(line.strip() == "*** Begin Patch" for line in lines):
+            update_lines: list[str] = []
+            in_update = False
+            update_count = 0
+            for line in lines:
+                stripped = line.strip()
+                if stripped == "*** Begin Patch":
+                    continue
+                if stripped.startswith("*** Update File:"):
+                    update_count += 1
+                    if update_count > 1:
+                        raise AgentError("apply_patch accepts one file per call")
+                    in_update = True
+                    continue
+                if stripped.startswith("*** End Patch"):
+                    break
+                if stripped.startswith(("*** Add File:", "*** Delete File:", "*** Move to:")):
+                    raise AgentError("apply_patch only supports updating an existing file")
+                if in_update:
+                    update_lines.append(line)
+            if not update_lines:
+                raise AgentError("invalid patch: missing *** Update File section")
+            lines = update_lines
         hunk_indexes = [i for i, line in enumerate(lines) if line.startswith("@@")]
         if not hunk_indexes:
             raise AgentError("invalid patch: missing @@ hunk header")
+        if any(not re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", lines[i]) for i in hunk_indexes):
+            return Workspace._apply_flexible_diff(old, lines, hunk_indexes)
+        try:
+            return Workspace._apply_numbered_diff(old, lines, hunk_indexes)
+        except AgentError as exc:
+            # A model may provide correct context with stale line numbers after
+            # an earlier edit. Relocate only when the exact context still matches.
+            if ("patch context does not match" in str(exc)
+                    or "patch removal does not match" in str(exc)
+                    or "patch context is outside" in str(exc)):
+                return Workspace._apply_flexible_diff(old, lines, hunk_indexes)
+            raise
+
+    @staticmethod
+    def _apply_numbered_diff(old: list[str], lines: list[str], hunk_indexes: list[int]) -> list[str]:
+        """Apply a fully numbered unified diff at its declared line offsets."""
         result: list[str] = []
         old_cursor = 0
         for index, hunk_start in enumerate(hunk_indexes):
@@ -1060,18 +1104,81 @@ class Workspace:
                     continue
                 marker, content = line[0], line[1:]
                 if marker == " ":
-                    if cursor >= len(old) or old[cursor] != content:
+                    if cursor >= len(old) or not Workspace._same_line(old[cursor], content):
                         raise AgentError("patch context does not match file")
-                    result.append(content)
+                    result.append(old[cursor])
                     cursor += 1
                 elif marker == "-":
-                    if cursor >= len(old) or old[cursor] != content:
+                    if cursor >= len(old) or not Workspace._same_line(old[cursor], content):
                         raise AgentError("patch removal does not match file")
                     cursor += 1
                 elif marker == "+":
                     result.append(content)
                 else:
                     raise AgentError(f"invalid patch line: {line.strip()}")
+            old_cursor = cursor
+        result.extend(old[old_cursor:])
+        return result
+
+    @staticmethod
+    def _same_line(left: str, right: str) -> bool:
+        """Compare patch text without treating LF/CRLF as different content."""
+        return left.replace("\r\n", "\n") == right.replace("\r\n", "\n")
+
+    @staticmethod
+    def _apply_flexible_diff(old: list[str], lines: list[str], hunk_indexes: list[int]) -> list[str]:
+        """Apply a diff with abbreviated hunk headers using context search."""
+        result: list[str] = []
+        old_cursor = 0
+        for index, hunk_start in enumerate(hunk_indexes):
+            header = lines[hunk_start].strip()
+            if not re.match(r"^@@(?:\s.*)?$", header):
+                raise AgentError(f"invalid patch hunk header: {header}")
+            numbered_header = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", header)
+            preferred_start = int(numbered_header.group(1)) - 1 if numbered_header else None
+            body_end = hunk_indexes[index + 1] if index + 1 < len(hunk_indexes) else len(lines)
+            operations: list[tuple[str, str]] = []
+            for line in lines[hunk_start + 1:body_end]:
+                if line.startswith("\\ No newline"):
+                    continue
+                if line.startswith(("*** ", "--- ", "+++ ")):
+                    continue
+                if line.startswith(("+", "-", " ")):
+                    operations.append((line[0], line[1:]))
+                else:
+                    # Codex-style abbreviated hunks may omit the context marker.
+                    operations.append((" ", line))
+            expected = [content for marker, content in operations if marker in {" ", "-"}]
+            source_start = old_cursor
+            if expected:
+                matches: list[int] = []
+                for candidate in range(old_cursor, len(old) - len(expected) + 1):
+                    if all(Workspace._same_line(old[candidate + offset], content)
+                           for offset, content in enumerate(expected)):
+                        matches.append(candidate)
+                if not matches:
+                    raise AgentError("patch context does not match file")
+                source_start = min(
+                    matches,
+                    key=lambda candidate: abs(candidate - preferred_start)
+                    if preferred_start is not None else candidate,
+                )
+            result.extend(old[old_cursor:source_start])
+            cursor = source_start
+            for marker, content in operations:
+                if marker == " ":
+                    if cursor >= len(old) or not Workspace._same_line(old[cursor], content):
+                        raise AgentError("patch context does not match file")
+                    result.append(old[cursor])
+                    cursor += 1
+                elif marker == "-":
+                    if cursor >= len(old) or not Workspace._same_line(old[cursor], content):
+                        raise AgentError("patch removal does not match file")
+                    cursor += 1
+                elif marker == "+":
+                    result.append(content)
+                else:
+                    raise AgentError(f"invalid patch line: {content.strip()}")
             old_cursor = cursor
         result.extend(old[old_cursor:])
         return result
@@ -1126,6 +1233,10 @@ class Workspace:
 
 SYSTEM_PROMPT = """You are a careful coding agent working in a local workspace.
 Inspect before editing. Use tools for all file reads and changes; do not pretend a change happened.
+For apply_patch, prefer a complete single-file unified diff with ---/+++
+headers and @@ -start,count +start,count @@ hunks. The tool also accepts
+Codex-style *** Begin Patch wrappers. If a patch is rejected, reread the file,
+regenerate the patch from that exact content, or use write_file for a small file.
 Use read_pdf for PDF text extraction and read_docx for Word DOCX paragraphs and tables. Set include_images=true when visual content matters; use read_image for standalone images. The local agent attaches images as multimodal input, so the configured model must support vision. Scanned PDFs can be rendered for visual inspection, while legacy .doc files must be converted first.
 Explain a concise plan, make the smallest useful edits, and run relevant tests when approved.
 After changing files, call verify_task with the narrowest relevant test, lint, or build command.

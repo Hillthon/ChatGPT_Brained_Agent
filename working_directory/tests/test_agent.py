@@ -223,6 +223,53 @@ class AgentTests(unittest.TestCase):
             self.assertIn("patched", workspace.apply_patch("a.txt", patch))
             self.assertEqual((Path(directory) / "a.txt").read_text(), "one\nthree\n")
 
+    def test_apply_codex_style_abbreviated_patch(self):
+        old = ["def mean(values):\n", "    return sum(values) / len(values)\n"]
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: math_utils.py\n"
+            "@@\n"
+            "def mean(values):\n"
+            "-    return sum(values) / len(values)\n"
+            "+    return sum(values) / len(values) if values else 0\n"
+            "*** End Patch\n"
+        )
+        result = Workspace._apply_unified_diff(old, patch)
+        self.assertEqual(result, ["def mean(values):\n", "    return sum(values) / len(values) if values else 0\n"])
+
+    def test_apply_patch_matches_crlf_context(self):
+        old = ["one\r\n", "two\r\n"]
+        patch = "@@ -1,2 +1,2 @@\n one\n-two\n+three\n"
+        result = Workspace._apply_unified_diff(old, patch)
+        self.assertEqual(result, ["one\r\n", "three\n"])
+
+    def test_apply_patch_relocates_stale_numbered_hunk(self):
+        old = ["header\n", "def mean(values):\n", "    return sum(values) / len(values)\n"]
+        patch = (
+            "--- a/math_utils.py\n"
+            "+++ b/math_utils.py\n"
+            "@@ -20,2 +20,2 @@\n"
+            " def mean(values):\n"
+            "-    return sum(values) / len(values)\n"
+            "+    return 0\n"
+        )
+        result = Workspace._apply_unified_diff(old, patch)
+        self.assertEqual(result, ["header\n", "def mean(values):\n", "    return 0\n"])
+
+    def test_apply_patch_rejects_multi_file_codex_wrapper(self):
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: a.txt\n"
+            "@@\n"
+            "+one\n"
+            "*** Update File: b.txt\n"
+            "@@\n"
+            "+two\n"
+            "*** End Patch\n"
+        )
+        with self.assertRaises(AgentError):
+            Workspace._apply_unified_diff([], patch)
+
     def test_agent_executes_tool_then_finishes(self):
         replies = [
             {"content": "", "tool_calls": [{"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "x.txt", "content": "ok"})}}]},

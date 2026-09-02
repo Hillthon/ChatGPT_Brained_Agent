@@ -349,7 +349,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="A small local coding agent")
     parser.add_argument("task", nargs="?", help="initial programming task; more tasks can follow interactively")
     parser.add_argument("--root", default="./working_directory", help="workspace root")
-    parser.add_argument("--model", default=os.environ.get("CODING_AGENT_MODEL", "gpt-5.6-sol"))
+    parser.add_argument("--model", default=os.environ.get("CODING_AGENT_MODEL", "gpt-5.6-luna"))
     parser.add_argument(
         "--base-url",
         default=(os.environ.get("CODING_AGENT_BASE_URL") or os.environ.get("RIGHTAPI_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://rightapi.ai/codex/v1"),
