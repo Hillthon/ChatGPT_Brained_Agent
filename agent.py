@@ -6,6 +6,7 @@ this process, which keeps the important execution logic local and inspectable.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import difflib
 import os
@@ -44,8 +45,12 @@ class AgentConfig:
     ))
     max_steps: int = 100
     max_context_chars: int = 80_000
+    max_context_tokens: int = 32_000
+    max_output_tokens: int = 4_000
     command_timeout: int = 30
     max_output_chars: int = 12_000
+    tool_result_max_chars: int = 6_000
+    task_summary_max_chars: int = 2_000
     api_mode: str = field(default_factory=lambda: os.environ.get("CODING_AGENT_API_MODE", "auto"))
     request_timeout: int = 120
 
@@ -233,6 +238,7 @@ class OpenAICompatibleClient:
             "messages": messages,
             "tools": tools,
             "tool_choice": "auto",
+            "max_tokens": self.config.max_output_tokens,
         })
         try:
             message = payload["choices"][0]["message"]
@@ -327,6 +333,7 @@ class OpenAICompatibleClient:
             "input": self._responses_input(messages),
             "tools": self._responses_tools(tools),
             "store": False,
+            "max_output_tokens": self.config.max_output_tokens,
         })
         return self._responses_message(payload)
 
@@ -342,6 +349,7 @@ class OpenAICompatibleClient:
             "messages": messages,
             "tools": tools,
             "tool_choice": "auto",
+            "max_tokens": self.config.max_output_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -417,6 +425,7 @@ class OpenAICompatibleClient:
             "input": self._responses_input(messages),
             "tools": self._responses_tools(tools),
             "store": False,
+            "max_output_tokens": self.config.max_output_tokens,
             "stream": True,
         }
         self._debug("model_request", {"endpoint": endpoint, "body": body})
@@ -862,6 +871,7 @@ class CodingAgent:
         if self.messages[0].get("role") != "system":
             raise AgentError("session history must start with a system message")
         self.on_history_change = on_history_change
+        self.context_messages: list[dict[str, Any]] = deepcopy(self.messages)
 
     def _checkpoint(self) -> None:
         if self.on_history_change:
@@ -875,29 +885,154 @@ class CodingAgent:
         """Keep local undo operations visible to subsequent model turns."""
         self._append_message({"role": "system", "content": f"Local workspace event: {content}"})
 
-    def _trim_context(self) -> None:
-        serialized = json.dumps(self.messages, ensure_ascii=False)
-        if len(serialized) <= self.config.max_context_chars:
-            return
+    @staticmethod
+    def _estimate_tokens(value: str) -> int:
+        """Conservative standard-library token estimate for mixed text and code."""
+        return max(1, (len(value) + 2) // 3)
+
+    def _compact_tool_result(self, content: str, seen: dict[str, str]) -> str:
+        digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+        if digest in seen:
+            return f"[duplicate tool result omitted; same as {seen[digest]}]"
+        seen[digest] = digest[:8]
+        limit = max(200, self.config.tool_result_max_chars)
+        if len(content) <= limit:
+            return content
+        head = max(80, limit // 3)
+        tail = max(80, limit - head - 80)
+        omitted = len(content) - head - tail
+        return f"{content[:head]}\n...[{omitted} chars omitted]...\n{content[-tail:]}"
+
+    def _compact_messages(self) -> list[dict[str, Any]]:
+        """Copy history for the model, bounding large and repeated tool observations."""
+        seen: dict[str, str] = {}
+        compacted: list[dict[str, Any]] = []
+        for message in self.messages:
+            copy = deepcopy(message)
+            if copy.get("role") == "tool" and isinstance(copy.get("content"), str):
+                copy["content"] = self._compact_tool_result(copy["content"], seen)
+            compacted.append(copy)
+        return compacted
+
+    def _summarize_turns(self, turns: list[list[dict[str, Any]]]) -> str:
+        """Extract a small deterministic memory from turns removed from active context."""
+        if not turns:
+            return ""
+        tasks: list[str] = []
+        files: list[str] = []
+        verifications: list[str] = []
+        errors: list[str] = []
+        completions: list[str] = []
+
+        def add_unique(values: list[str], value: str, limit: int = 8) -> None:
+            value = " ".join(value.split()).strip()
+            if value and value not in values and len(values) < limit:
+                values.append(value)
+
+        for turn in turns:
+            for message in turn:
+                role = message.get("role")
+                content = message.get("content")
+                if role == "user" and isinstance(content, str):
+                    add_unique(tasks, content[:240], limit=6)
+                if role == "assistant":
+                    for call in message.get("tool_calls") or []:
+                        if not isinstance(call, dict):
+                            continue
+                        function = call.get("function") or {}
+                        if not isinstance(function, dict):
+                            continue
+                        name = function.get("name", "")
+                        raw_args = function.get("arguments", {})
+                        args: dict[str, Any] = {}
+                        if isinstance(raw_args, str):
+                            try:
+                                decoded = json.loads(raw_args)
+                                if isinstance(decoded, dict):
+                                    args = decoded
+                            except json.JSONDecodeError:
+                                pass
+                        elif isinstance(raw_args, dict):
+                            args = raw_args
+                        path = args.get("path")
+                        if name in {"write_file", "apply_patch"} and isinstance(path, str):
+                            add_unique(files, path)
+                if role == "tool" and isinstance(content, str):
+                    if content.startswith("verification_passed"):
+                        add_unique(verifications, "passed")
+                    elif content.startswith("verification_failed"):
+                        add_unique(verifications, "failed")
+                    if content.startswith("TASK_COMPLETED:"):
+                        add_unique(completions, content.removeprefix("TASK_COMPLETED:")[:240])
+                    if content.startswith(("ERROR:", "verification_failed", "DENIED", "TIMEOUT")):
+                        add_unique(errors, content.split("\n", 1)[0][:240])
+
+        lines = ["<deterministic_task_summary>", "Earlier task context was compacted locally. Preserve these facts:"]
+        if tasks:
+            lines.append("Tasks: " + " | ".join(tasks))
+        if files:
+            lines.append("Files touched: " + ", ".join(files))
+        if verifications:
+            lines.append("Verification: " + ", ".join(verifications))
+        if completions:
+            lines.append("Completion summaries: " + " | ".join(completions))
+        if errors:
+            lines.append("Errors or warnings: " + " | ".join(errors))
+        lines.append("</deterministic_task_summary>")
+        summary = "\n".join(lines)
+        limit = max(400, self.config.task_summary_max_chars)
+        return summary if len(summary) <= limit else summary[:limit - 35] + "\n...[summary truncated]\n</deterministic_task_summary>"
+
+    def _trim_context(self) -> list[dict[str, Any]]:
+        """Build a bounded model context without deleting the persisted full history."""
+        compacted = self._compact_messages()
+        serialized = json.dumps(compacted, ensure_ascii=False)
+        input_token_budget = max(1, self.config.max_context_tokens - self.config.max_output_tokens)
+        if (
+            len(serialized) <= self.config.max_context_chars
+            and self._estimate_tokens(serialized) <= input_token_budget
+        ):
+            self.context_messages = compacted
+            return deepcopy(compacted)
         # Keep complete user turns so trimming never separates a request from its response or
         # an assistant tool call from its results. The newest turn is kept even if it alone is
         # larger than the target, so the current user request is never silently discarded.
-        system = self.messages[0]
+        system = compacted[0]
         turns: list[list[dict[str, Any]]] = []
-        for message in self.messages[1:]:
+        for message in compacted[1:]:
             if message.get("role") == "user" or not turns:
                 turns.append([])
             turns[-1].append(message)
         kept_turns: list[list[dict[str, Any]]] = []
         size = len(json.dumps(system, ensure_ascii=False))
+        token_size = self._estimate_tokens(json.dumps(system, ensure_ascii=False))
         for turn in reversed(turns):
             cost = len(json.dumps(turn, ensure_ascii=False))
-            if kept_turns and size + cost > self.config.max_context_chars:
+            token_cost = self._estimate_tokens(json.dumps(turn, ensure_ascii=False))
+            over_chars = size + cost > self.config.max_context_chars
+            over_tokens = token_size + token_cost > input_token_budget
+            if kept_turns and (over_chars or over_tokens):
                 break
             kept_turns.insert(0, turn)
             size += cost
-        self.messages = [system] + [message for turn in kept_turns for message in turn]
-        self._checkpoint()
+            token_size += token_cost
+        dropped_turns = turns[:max(0, len(turns) - len(kept_turns))]
+        summary = self._summarize_turns(dropped_turns)
+        prefix = [system]
+        if summary:
+            prefix.append({"role": "system", "content": summary})
+        # The summary is smaller than the dropped turns, but it still counts against
+        # both budgets. Drop additional old turns if needed while retaining the newest.
+        while len(kept_turns) > 1:
+            candidate = prefix + [message for turn in kept_turns for message in turn]
+            candidate_json = json.dumps(candidate, ensure_ascii=False)
+            if len(candidate_json) <= self.config.max_context_chars and self._estimate_tokens(candidate_json) <= input_token_budget:
+                break
+            dropped_turns.append(kept_turns.pop(0))
+            summary = self._summarize_turns(dropped_turns)
+            prefix = [system] + ([{"role": "system", "content": summary}] if summary else [])
+        self.context_messages = prefix + [message for turn in kept_turns for message in turn]
+        return deepcopy(self.context_messages)
 
     @staticmethod
     def _tool_ok(name: str, result: str) -> bool:
@@ -948,7 +1083,7 @@ class CodingAgent:
         self._last_task_status = "incomplete"
         self._append_message({"role": "user", "content": task})
         for step in range(1, self.config.max_steps + 1):
-            self._trim_context()
+            context = self._trim_context()
             emit(("thinking", {"step": step, "max_steps": self.config.max_steps}))
             streamed = False
             stream_complete = getattr(self.client, "complete_stream", None)
@@ -959,12 +1094,12 @@ class CodingAgent:
                 if callable(stream_complete):
                     streamed = True
                     assistant = stream_complete(
-                        self.messages,
+                        context,
                         TOOL_SCHEMAS,
                         on_delta=lambda text: emit(("assistant_delta", text)),
                     )
                 else:
-                    assistant = self.client.complete(self.messages, TOOL_SCHEMAS)
+                    assistant = self.client.complete(context, TOOL_SCHEMAS)
             finally:
                 if hasattr(self.client, "debug_handler"):
                     self.client.debug_handler = previous_debug
