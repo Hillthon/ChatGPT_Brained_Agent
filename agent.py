@@ -56,12 +56,8 @@ class AgentConfig:
     max_image_bytes: int = 2_000_000
     max_image_dimension: int = 2048
     max_image_pages: int = 4
-    max_steps: int = 100
-    max_context_chars: int = 80_000
     max_context_tokens: int = 32_000
     max_output_tokens: int = 4_000
-    command_timeout: int = 30
-    max_output_chars: int = 12_000
     tool_result_max_chars: int = 6_000
     task_summary_max_chars: int = 2_000
     api_mode: str = field(default_factory=lambda: os.environ.get("CODING_AGENT_API_MODE", "auto"))
