@@ -543,8 +543,66 @@ data: [DONE]
                 config=AgentConfig(max_context_chars=1),
                 messages=messages,
             )
-            agent._trim_context()
-        self.assertEqual(agent.messages, [messages[0], messages[-1]])
+            context = agent._trim_context()
+        self.assertEqual(context[0], messages[0])
+        self.assertIn("deterministic_task_summary", context[1]["content"])
+        self.assertEqual(context[-1], messages[-1])
+        self.assertEqual(agent.messages, messages)
+
+    def test_context_compacts_large_and_duplicate_tool_results_without_mutating_history(self):
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "inspect"},
+            {"role": "tool", "tool_call_id": "1", "content": "same result\n" * 5000},
+            {"role": "assistant", "content": "again"},
+            {"role": "tool", "tool_call_id": "2", "content": "same result\n" * 5000},
+            {"role": "user", "content": "current"},
+        ]
+        with TemporaryDirectory() as directory:
+            agent = CodingAgent(
+                FakeClient([]),
+                Workspace(directory),
+                config=AgentConfig(max_context_chars=20_000, max_context_tokens=10_000, max_output_tokens=2_000, tool_result_max_chars=500),
+                messages=messages,
+            )
+            context = agent._trim_context()
+        tool_contents = [message["content"] for message in context if message["role"] == "tool"]
+        self.assertTrue(any("chars omitted" in content for content in tool_contents))
+        self.assertTrue(any("duplicate tool result omitted" in content for content in tool_contents))
+        self.assertEqual(agent.messages[2]["content"], messages[2]["content"])
+        self.assertEqual(context[-1], messages[-1])
+
+    def test_context_keeps_a_deterministic_summary_of_dropped_tasks(self):
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "修复学生查询接口"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "1",
+                "function": {"name": "write_file", "arguments": json.dumps({"path": "student_service.py", "content": "..."})},
+            }]},
+            {"role": "tool", "tool_call_id": "1", "content": "wrote student_service.py"},
+            {"role": "tool", "tool_call_id": "2", "content": "verification_passed\nexit_code=0"},
+            {"role": "assistant", "content": "TASK_COMPLETED: 查询接口已修复"},
+            {"role": "user", "content": "继续检查当前接口"},
+        ]
+        with TemporaryDirectory() as directory:
+            agent = CodingAgent(
+                FakeClient([]),
+                Workspace(directory),
+                config=AgentConfig(max_context_chars=260, max_context_tokens=200, max_output_tokens=50),
+                messages=messages,
+            )
+            context = agent._trim_context()
+        summaries = [
+            message["content"] for message in context
+            if message.get("role") == "system" and "deterministic_task_summary" in message.get("content", "")
+        ]
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("修复学生查询接口", summaries[0])
+        self.assertIn("student_service.py", summaries[0])
+        self.assertIn("passed", summaries[0])
+        self.assertEqual(context[-1]["content"], "继续检查当前接口")
+        self.assertEqual(agent.messages, messages)
 
     def test_chat_client_uses_relay_endpoint_and_auth(self):
         response = _FakeResponse({"choices": [{"message": {"role": "assistant", "content": "done"}}]})
