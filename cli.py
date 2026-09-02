@@ -411,7 +411,7 @@ def main() -> int:
     renderer = Renderer(args.verbose or 0, args.quiet, color=False if args.no_color else None)
     renderer._line(renderer._paint(WELCOME_TEXT, "cyan"))
     if not args.quiet:
-        renderer._line(renderer._paint("A Coding Agent Made by QuanYuan| Safe Workspace Tools | Persistent Sessions", "yellow"))
+        renderer._line(renderer._paint("A Coding Agent| Safe Workspace Tools | Persistent Sessions", "yellow"))
     store = SessionStore(args.session_dir)
     if args.list_sessions:
         print(format_sessions(store.list_sessions()))
