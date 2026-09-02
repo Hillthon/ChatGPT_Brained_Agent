@@ -144,6 +144,10 @@ class Renderer:
             return f"apply_patch  {self._short_path(args.get('path'))}"
         if name == "run_command":
             return f"run_command  {str(args.get('command', '')).strip()}"
+        if name == "verify_task":
+            return f"verify_task  {str(args.get('command', '')).strip()}"
+        if name == "finish_task":
+            return "finish_task"
         return f"{name}  {json.dumps(args, ensure_ascii=False, separators=(',', ':'))}"
 
     def approval_prompt(self, action: str) -> str:
@@ -266,6 +270,15 @@ class Renderer:
             if isinstance(payload, str) and payload:
                 self._write(payload)
                 self._answer_started = True
+        elif kind == "completion_rejected":
+            self._clear_status()
+            if not self.quiet:
+                data = payload if isinstance(payload, dict) else {}
+                self._line("Completion blocked: " + str(data.get("reason", "verification is required")))
+        elif kind == "verification_required":
+            self._clear_status()
+            if not self.quiet:
+                self._line("Verification required before completion")
         elif kind == "run_end":
             self._clear_status()
             self._finish_answer_line()
@@ -278,7 +291,8 @@ class Renderer:
                 if not isinstance(total, (int, float)):
                     total = (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)
                 tokens = f" · {int(total):,} tokens" if total else ""
-                self._line(f"本轮 {steps} 步{tokens} · {elapsed:.1f}s")
+                status = data.get("completion_status", "incomplete")
+                self._line(f"本轮 {steps} 步 · {status}{tokens} · {elapsed:.1f}s")
             self._answer_started = False
 
     def error(self, error: BaseException) -> None:

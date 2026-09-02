@@ -97,7 +97,8 @@ class AgentTests(unittest.TestCase):
     def test_agent_executes_tool_then_finishes(self):
         replies = [
             {"content": "", "tool_calls": [{"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "x.txt", "content": "ok"})}}]},
-            {"content": "done", "tool_calls": []},
+            {"content": "", "tool_calls": [{"id": "2", "function": {"name": "verify_task", "arguments": json.dumps({"command": "echo verification"})}}]},
+            {"content": "", "tool_calls": [{"id": "3", "function": {"name": "finish_task", "arguments": json.dumps({"summary": "done"})}}]},
         ]
         with TemporaryDirectory() as directory:
             workspace = Workspace(directory, approve=lambda _: True)
@@ -108,7 +109,8 @@ class AgentTests(unittest.TestCase):
     def test_agent_file_tools_create_persistent_undo_checkpoints(self):
         replies = [
             {"content": "", "tool_calls": [{"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "x.txt", "content": "after"})}}]},
-            {"content": "done", "tool_calls": []},
+            {"content": "", "tool_calls": [{"id": "2", "function": {"name": "verify_task", "arguments": json.dumps({"command": "echo verification"})}}]},
+            {"content": "", "tool_calls": [{"id": "3", "function": {"name": "finish_task", "arguments": json.dumps({"summary": "done"})}}]},
         ]
         with TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
@@ -130,10 +132,12 @@ class AgentTests(unittest.TestCase):
     def test_agent_undo_and_task_rollback_end_to_end(self):
         replies = [
             {"content": "", "tool_calls": [{"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "app.txt", "content": "first"})}}]},
-            {"content": "first task done", "tool_calls": []},
+            {"content": "", "tool_calls": [{"id": "v1", "function": {"name": "verify_task", "arguments": json.dumps({"command": "echo verification"})}}]},
+            {"content": "", "tool_calls": [{"id": "f1", "function": {"name": "finish_task", "arguments": json.dumps({"summary": "first task done"})}}]},
             {"content": "", "tool_calls": [{"id": "2", "function": {"name": "write_file", "arguments": json.dumps({"path": "app.txt", "content": "second"})}}]},
             {"content": "", "tool_calls": [{"id": "3", "function": {"name": "write_file", "arguments": json.dumps({"path": "new.txt", "content": "created"})}}]},
-            {"content": "second task done", "tool_calls": []},
+            {"content": "", "tool_calls": [{"id": "v2", "function": {"name": "verify_task", "arguments": json.dumps({"command": "echo verification"})}}]},
+            {"content": "", "tool_calls": [{"id": "f2", "function": {"name": "finish_task", "arguments": json.dumps({"summary": "second task done"})}}]},
         ]
         with TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
@@ -159,6 +163,49 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(existing.read_text(encoding="utf-8"), "original")
             self.assertFalse(created.exists())
             self.assertEqual(workspace.undo_checkpoints(), [])
+
+    def test_completion_requires_verification_after_file_changes(self):
+        replies = [
+            {"content": "", "tool_calls": [{"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "x.txt", "content": "after"})}}]},
+            {"content": "", "tool_calls": [{"id": "2", "function": {"name": "finish_task", "arguments": json.dumps({"summary": "premature"})}}]},
+            {"content": "", "tool_calls": [{"id": "3", "function": {"name": "verify_task", "arguments": json.dumps({"command": "echo verification"})}}]},
+            {"content": "", "tool_calls": [{"id": "4", "function": {"name": "finish_task", "arguments": json.dumps({"summary": "verified"})}}]},
+        ]
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            manager = UndoManager(Path(directory) / "snapshots", "session-1", root)
+            workspace = Workspace(root, approve=lambda _: True, undo_manager=manager)
+            events = []
+
+            result = CodingAgent(FakeClient(replies), workspace).run("edit x", on_event=events.append)
+
+            self.assertEqual(result, "verified")
+            self.assertIn("completion_rejected", [kind for kind, _ in events])
+            self.assertEqual((root / "x.txt").read_text(encoding="utf-8"), "after")
+
+    def test_failed_verification_does_not_close_the_task(self):
+        replies = [
+            {"content": "", "tool_calls": [{"id": "1", "function": {"name": "write_file", "arguments": json.dumps({"path": "x.txt", "content": "after"})}}]},
+            {"content": "", "tool_calls": [{"id": "2", "function": {"name": "verify_task", "arguments": json.dumps({"command": "python -c \"import sys; sys.exit(1)\""})}}]},
+            {"content": "", "tool_calls": [{"id": "3", "function": {"name": "finish_task", "arguments": json.dumps({"summary": "still broken"})}}]},
+            {"content": "", "tool_calls": [{"id": "4", "function": {"name": "verify_task", "arguments": json.dumps({"command": "echo fixed"})}}]},
+            {"content": "", "tool_calls": [{"id": "5", "function": {"name": "finish_task", "arguments": json.dumps({"summary": "verified after retry"})}}]},
+        ]
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "workspace"
+            root.mkdir()
+            manager = UndoManager(Path(directory) / "snapshots", "session-1", root)
+            workspace = Workspace(root, approve=lambda _: True, undo_manager=manager)
+            events = []
+
+            result = CodingAgent(
+                FakeClient(replies), workspace, config=AgentConfig(max_steps=6)
+            ).run("edit x", on_event=events.append)
+
+            self.assertEqual(result, "verified after retry")
+            failed = [payload for kind, payload in events if kind == "tool_end" and payload["name"] == "verify_task" and not payload["ok"]]
+            self.assertEqual(len(failed), 1)
 
     def test_denied_write_does_not_create_an_undo_checkpoint(self):
         replies = [
